@@ -181,11 +181,15 @@ namespace oxygine
 
 
         alcMakeContextCurrent(0);
-        alcDestroyContext(_context);
-        _context = 0;
+        if (_context)  {
+          alcDestroyContext(_context);
+          _context = 0;
+        }
 
-        alcCloseDevice(_device);
-        _device = 0;
+        if (_device) {
+          alcCloseDevice(_device);
+          _device = 0;
+        }
     }
 
 
