@@ -77,7 +77,7 @@ static int alc_opensles_get_android_api()
     jfieldID androidSdkIntField = NULL;
     int androidApiLevel = 0;
     JNIEnv* env = NULL;
-    
+
     (*javaVM)->GetEnv(javaVM, (void**)&env, JNI_VERSION_1_4);
     androidVersionClass = (*env)->FindClass(env, "android/os/Build$VERSION");
     if (androidVersionClass)
@@ -101,7 +101,7 @@ static char *alc_opensles_get_android_model()
         jstring androidModelString = NULL;
         int androidApiLevel = 0;
         JNIEnv* env = NULL;
-        
+
         (*javaVM)->GetEnv(javaVM, (void**)&env, JNI_VERSION_1_4);
         (*env)->PushLocalFrame(env, 5);
         androidBuildClass = (*env)->FindClass(env, "android/os/Build");
@@ -206,7 +206,7 @@ static void devlist_remove(ALCdevice *pDevice) {
 
 static void devlist_process(deviceListFn mapFunction) {
     int i;
-    pthread_mutex_lock(&(deviceListMutex));    
+    pthread_mutex_lock(&(deviceListMutex));
     for (i = 0; i < MAX_DEVICES; i++) {
         if (deviceList[i]) {
             pthread_mutex_unlock(&(deviceListMutex));
@@ -235,7 +235,7 @@ static void *playback_function(void * context) {
 
     while (1) {
         if (devState->threadShouldRun == 0) {
-            return NULL;
+            pthread_exit(0);
         }
 
         bufferIndex = (++bufferIndex) % bufferCount;
@@ -247,10 +247,10 @@ static void *playback_function(void * context) {
         while (1) {
             if (devState->threadShouldRun == 0) {
                 pthread_mutex_unlock(&(buffer->mutex));
-                return NULL;
+                pthread_exit(0);
             }
 
-            // This is a little hacky, but here we avoid mixing too much data            
+            // This is a little hacky, but here we avoid mixing too much data
             if (buffer->state == OUTPUT_BUFFER_STATE_FREE) {
                 int i = (bufferIndex - premixCount) % bufferCount;
                 outputBuffer_t *buffer1 = &(devState->outputBuffers[i]);
@@ -258,7 +258,7 @@ static void *playback_function(void * context) {
                     buffer1->state == OUTPUT_BUFFER_STATE_FREE) {
                     break;
                 }
-            } 
+            }
 
             // No buffer available, wait for a buffer to become available
             // or until playback is stopped/suspended
@@ -352,8 +352,10 @@ static void start_playback(ALCdevice *pDevice) {
 
 static void stop_playback(ALCdevice *pDevice) {
     opesles_data_t *devState = (opesles_data_t *) pDevice->ExtraData;
-    devState->threadShouldRun = 0;
-    pthread_join(devState->playbackThread, NULL);
+    if (devState->threadShouldRun == 1) {
+      devState->threadShouldRun = 0;
+      pthread_join(devState->playbackThread, NULL);
+    }
     return;
 }
 
@@ -373,14 +375,14 @@ static void opensles_callback(SLAndroidSimpleBufferQueueItf bq, void *context)
     buffer = &(devState->outputBuffers[bufferIndex]);
 
     pthread_mutex_lock(&(buffer->mutex));
-    // We will block until 'next' buffer has mixed audio, but first flag oldest equeued buffer as free 
+    // We will block until 'next' buffer has mixed audio, but first flag oldest equeued buffer as free
     for (i = 1; i <= bufferCount; i++) {
         unsigned int j = (devState->lastBufferEnqueued+i) % bufferCount;
         outputBuffer_t *bufferFree = &(devState->outputBuffers[j]);
         if (bufferFree->state == OUTPUT_BUFFER_STATE_ENQUEUED) {
             bufferFree->state = OUTPUT_BUFFER_STATE_FREE;
             break;
-        } 
+        }
     }
     while (buffer->state != OUTPUT_BUFFER_STATE_MIXED) {
         clock_gettime(CLOCK_REALTIME, &ts);
@@ -533,7 +535,7 @@ static ALCboolean opensles_reset_playback(ALCdevice *pDevice)
     result = (*engineEngine)->CreateAudioPlayer(engineEngine, &devState->bqPlayerObject, &audioSrc, &audioSnk,
         1, ids, req);
     if ((result != SL_RESULT_SUCCESS) || (devState->bqPlayerObject == NULL)) {
-        //RELEASE_LOG("create audio player is null or errored: %lx", result); 
+        //RELEASE_LOG("create audio player is null or errored: %lx", result);
         return ALC_FALSE;
     }
 
@@ -631,7 +633,7 @@ BackendFuncs opensles_funcs = {
 
 // global entry points called from XYZZY
 
- 
+
 static void suspend_device(ALCdevice *pDevice) {
     SLresult result;
     if (pDevice) {
@@ -667,7 +669,7 @@ void alc_opensles_suspend()
 {
     devlist_process(&suspend_device);
 }
- 
+
 void alc_opensles_resume()
 {
     devlist_process(&resume_device);
@@ -782,7 +784,7 @@ void alc_opensles_probe(int type)
 #define LOAD_SYM_POINTER(sym) \
     p##sym = sym;
 
-    
+
     do { \
         p##sym = dlsym(dlHandle, #sym); \
         if((error=(typeof(error))dlerror()) != NULL) { \
@@ -791,7 +793,7 @@ void alc_opensles_probe(int type)
             return; \
         } \
     } while(0)
-  
+
 
     LOAD_SYM_POINTER(slCreateEngine);
     LOAD_SYM_POINTER(SL_IID_ENGINE);
