@@ -76,7 +76,6 @@ set(SRC
 
 
 add_library(oxygine-sound STATIC ${SRC})
-
 if(EMSCRIPTEN)
 	set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -s USE_OGG=1 -s USE_VORBIS=1" )
 
@@ -118,7 +117,7 @@ include_directories(${OXYGINESOUND_INCLUDE_DIRS})
 
 
 
-
+target_link_libraries(oxygine-sound oxygine-framework)
 target_link_libraries(oxygine-sound -lopenal)
 if (NOT EMSCRIPTEN)
    target_link_libraries(oxygine-sound -logg)
