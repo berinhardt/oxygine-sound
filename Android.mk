@@ -44,6 +44,7 @@ LOCAL_C_INCLUDES := $(OXYGINE_SRC)/ \
 					$(LOCAL_PATH)/dependencies/openal-android/jni/OpenAL/include \
 					$(LOCAL_PATH)/dependencies/tremor/Tremor \
 					$(LOCAL_PATH)/dependencies/libogg/include
+LOCAL_C_INCLUDES += $(LOCAL_PATH)/../glm/
 
 LOCAL_EXPORT_C_INCLUDES += $(LOCAL_PATH)/src
 LOCAL_EXPORT_CFLAGS += $(LOCAL_CFLAGS)
