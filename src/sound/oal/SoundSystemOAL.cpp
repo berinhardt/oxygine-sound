@@ -34,15 +34,14 @@ namespace oxygine
 
 #ifdef __ANDROID__
             device = alcOpenDevice("opensles");
-#else
-            device = alcOpenDevice(0);
+#endif
+            if (!device) device = alcOpenDevice(0);
 
             if (!device)
             {
                 sleep(100);
                 device = alcOpenDevice(0);
             }
-#endif
 
             if (device)
             {
