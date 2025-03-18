@@ -116,20 +116,23 @@ void threadStopProcessing(const ThreadMessages::message& msg) {
 }
 
 void StreamingSoundHandleOAL::asyncDecode() {
-   ALint nump;
-   alGetSourcei(_alSource, AL_BUFFERS_PROCESSED, &nump);
+   if (alIsSource(_alSource)) {
+      ALint nump;
+      alGetSourcei(_alSource, AL_BUFFERS_PROCESSED, &nump);
 
-   ALuint buffers[STREAM_BUFFERS];
+      if (nump > 0) {
+         ALuint buffers[STREAM_BUFFERS];
 
-   alSourceUnqueueBuffers(_alSource, nump, buffers);
-   OAL_CHECK();
-   decode(buffers, nump);
-
-   ALint state = 0;
-   alGetSourcei(_alSource, AL_SOURCE_STATE, &state);
-   if (state == AL_STOPPED)
-      alSourcePlay(_alSource);
-   OAL_CHECK();
+         alSourceUnqueueBuffers(_alSource, nump, buffers);
+         OAL_CHECK();
+         decode(buffers, nump);
+      }
+      ALint state = 0;
+      alGetSourcei(_alSource, AL_SOURCE_STATE, &state);
+      if (state == AL_STOPPED)
+         alSourcePlay(_alSource);
+      OAL_CHECK();
+   }
 }
 
 void StreamingSoundHandleOAL::decode(ALuint* buffers, int num) {
