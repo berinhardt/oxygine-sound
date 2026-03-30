@@ -103,7 +103,7 @@ void example_init()
     getStage()->addChild(Test::instance);
 
 
-#ifdef EMSCRIPTEN
+#ifdef __EMSCRIPTEN__
     emscStartSoundsPreloading(resources);
 #endif
 }

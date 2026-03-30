@@ -222,7 +222,7 @@ void StreamingSoundHandleOAL::_xresume() {
 }
 
 void StreamingSoundHandleOAL::_xupdate() {
-#ifndef EMSCRIPTEN
+#ifndef __EMSCRIPTEN__
    if (_stream->isStreamEnded()) {
       ALint state = 0;
       alGetSourcei(_alSource, AL_SOURCE_STATE, &state);

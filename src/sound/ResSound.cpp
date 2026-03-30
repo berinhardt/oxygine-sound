@@ -73,7 +73,7 @@ namespace oxygine
         std::string file = context.walker.getNode().attribute("file").as_string();
         _streaming = context.walker.getNode().attribute("streaming").as_bool(_streaming);
 
-#if EMSCRIPTEN
+#if __EMSCRIPTEN__
         _streaming = true;
 #endif
 
@@ -130,7 +130,7 @@ namespace oxygine
 
     void emscStartSoundsPreloading(Resources& resources)
     {
-#ifdef EMSCRIPTEN
+#ifdef __EMSCRIPTEN__
         Resources::resources lst;
         resources.collect(lst);
         for (size_t i = 0; i < lst.size(); ++i)
@@ -149,7 +149,7 @@ namespace oxygine
 
     int emscGetNumPreloadingSounds()
     {
-#ifdef EMSCRIPTEN
+#ifdef __EMSCRIPTEN__
 
         int r = EM_ASM_ARGS(
         {
