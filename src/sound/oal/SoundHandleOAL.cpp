@@ -45,9 +45,8 @@ void SoundHandleOAL::_play() {
 }
 
 void SoundHandleOAL::_resume() {
-   if (_alSource)
+   if (_alSource || !ss())
       return;
-
    _alSource = ss()->getSource();
 
    _restore();
