@@ -77,7 +77,7 @@ set(SRC
 
 add_library(oxygine-sound STATIC ${SRC})
 if(EMSCRIPTEN)
-	set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -s USE_OGG=1 -s USE_VORBIS=1" )
+	set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -s USE_VORBIS=1" )
 
 	set(OXYGINESOUND_LIBS
 		oxygine-sound -lopenal tremor -logg)
