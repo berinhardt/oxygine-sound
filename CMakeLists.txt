@@ -68,12 +68,9 @@ set(SRC
 
 add_library(oxygine-sound STATIC ${SRC})
 if(EMSCRIPTEN)
-	set(OXYGINESOUND_LIBS
-		oxygine-sound -lopenal tremor -logg)
-
-	set(linkFlags "-Wno-warn-absolute-paths")
-
-	set_target_properties(oxygine-sound PROPERTIES LINK_FLAGS "${linkFlags}")
+	# The library itself is linked by name on the consumer's link line, so it
+	# does not belong in this list of extra libraries.
+	set(OXYGINESOUND_LIBS -lopenal tremor -logg)
 
 else(EMSCRIPTEN)
 	if (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
