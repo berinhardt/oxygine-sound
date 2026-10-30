@@ -1,16 +1,7 @@
 cmake_minimum_required (VERSION 3.10)
 project (OXYGINESOUND)
 
-set(OXYGINESOUND_INCLUDE_DIRS
-	${CMAKE_CURRENT_SOURCE_DIR}/src
-	${CMAKE_CURRENT_SOURCE_DIR}/dependencies/tremor/Tremor
-	${CMAKE_CURRENT_SOURCE_DIR}/dependencies/libogg/include
-	)
-
-
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11")
-
-message(status ${OXYGINESOUND_INCLUDE_DIRS})
 
 set(OXYGINESOUND_DEFINITIONS
 	-DOXYGINE_SOUND=1)
@@ -85,9 +76,6 @@ if(EMSCRIPTEN)
 	set_target_properties(oxygine-sound PROPERTIES LINK_FLAGS "${linkFlags}")
 
 else(EMSCRIPTEN)
-	set(OXYGINESOUND_INCLUDE_DIRS ${OXYGINESOUND_INCLUDE_DIRS}
-		${CMAKE_CURRENT_SOURCE_DIR}/dependencies/openal/include)
-
 	if (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
 
 		set(OXYGINESOUND_LIBS oxygine-sound -lopenal tremor -logg)
@@ -111,8 +99,6 @@ else(EMSCRIPTEN)
 	endif()
 endif(EMSCRIPTEN)
 
-include_directories(${OXYGINESOUND_INCLUDE_DIRS})
-
 
 
 target_link_libraries(oxygine-sound oxygine-framework)
@@ -123,9 +109,17 @@ endif(NOT EMSCRIPTEN)
 
 
 #target_link_libraries(oxyginemagicparticles)
-set(OXYGINESOUND_INCLUDE_DIRS
-	${CMAKE_CURRENT_SOURCE_DIR}/src)
-
-set(OXYGINESOUND_INCLUDE_DIRS ${OXYGINESOUND_INCLUDE_DIRS} PARENT_SCOPE)
+# The only directory a consumer ever saw: it now travels with the library as a
+# usage requirement instead of being copied into the parent scope as a string.
+target_include_directories(oxygine-sound PUBLIC src)
+# Header directories the library's own sources compile against. The directory-scope
+# call used to apply them to every target in this directory; they are
+# implementation details of oxygine-sound, so they stay PRIVATE.
+target_include_directories(oxygine-sound PRIVATE
+	dependencies/tremor/Tremor
+	dependencies/libogg/include)
+if(NOT EMSCRIPTEN)
+	target_include_directories(oxygine-sound PRIVATE dependencies/openal/include)
+endif(NOT EMSCRIPTEN)
 set(OXYGINESOUND_LIBS ${OXYGINESOUND_LIBS} PARENT_SCOPE)
 set(OXYGINESOUND_DEFINITIONS ${OXYGINESOUND_DEFINITIONS} PARENT_SCOPE)
