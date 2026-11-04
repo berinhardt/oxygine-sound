@@ -3,9 +3,6 @@ project (OXYGINESOUND)
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11")
 
-set(OXYGINESOUND_DEFINITIONS
-	-DOXYGINE_SOUND=1)
-
 set(SRC
 	src/sound/ResSound.cpp
 	src/sound/ResSound.h
@@ -75,7 +72,7 @@ if(EMSCRIPTEN)
 else(EMSCRIPTEN)
 	if (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
 
-		set(OXYGINESOUND_LIBS oxygine-sound -lopenal tremor -logg)
+		set(OXYGINESOUND_LIBS -lopenal tremor -logg)
 
 	else()
 
@@ -90,19 +87,26 @@ else(EMSCRIPTEN)
 		set(OXYGINESOUND_LIBS
 			${CMAKE_CURRENT_SOURCE_DIR}/libs/win32/OpenAL32.lib
 			${CMAKE_CURRENT_SOURCE_DIR}/libs/win32/${LIBOGG}.lib
-			tremor
-			oxygine-sound)
+			tremor)
 
 	endif()
 endif(EMSCRIPTEN)
 
 
 
-target_link_libraries(oxygine-sound oxygine-framework)
-target_link_libraries(oxygine-sound -lopenal)
+# These used to be plain-signature calls, which CMake treats as PUBLIC. The
+# PUBLIC keyword says the same thing and is required here because a target
+# linked with the keyword signature cannot also be linked with the plain one.
+target_link_libraries(oxygine-sound PUBLIC oxygine-framework)
+target_link_libraries(oxygine-sound PUBLIC -lopenal)
 if (NOT EMSCRIPTEN)
-   target_link_libraries(oxygine-sound -logg)
+   target_link_libraries(oxygine-sound PUBLIC -logg)
 endif(NOT EMSCRIPTEN)
+
+# The extra libraries travel with the library as a usage requirement instead of
+# being exported to the parent scope as a string that every consumer had to
+# re-attach by hand.
+target_link_libraries(oxygine-sound PUBLIC ${OXYGINESOUND_LIBS})
 
 
 #target_link_libraries(oxyginemagicparticles)
@@ -118,5 +122,3 @@ target_include_directories(oxygine-sound PRIVATE
 if(NOT EMSCRIPTEN)
 	target_include_directories(oxygine-sound PRIVATE dependencies/openal/include)
 endif(NOT EMSCRIPTEN)
-set(OXYGINESOUND_LIBS ${OXYGINESOUND_LIBS} PARENT_SCOPE)
-set(OXYGINESOUND_DEFINITIONS ${OXYGINESOUND_DEFINITIONS} PARENT_SCOPE)
