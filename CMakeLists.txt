@@ -22,21 +22,12 @@ set(SRC
 	src/sound/null/SoundHandleNull.h
 	)
 
-#if(EMSCRIPTEN)
-#	set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11")
-#	set(SRC ${SRC}
-#		src/sound/emscripten/SoundSystemEmscripten.h
-#		src/sound/emscripten/SoundSystemEmscripten.cpp
-#		src/sound/emscripten/SoundHandleEmscripten.h
-#		src/sound/emscripten/SoundHandleEmscripten.cpp
-#		src/sound/emscripten/SoundEmscripten.h
-#		src/sound/emscripten/SoundEmscripten.cpp
-#
-#	)
-
-#else(EMSCRIPTEN)
-
-	add_subdirectory(dependencies/tremor tremor)
+# src/sound/emscripten/ holds an alternative emscripten backend --
+# SoundEmscripten, SoundHandleEmscripten, SoundSystemEmscripten and their
+# headers -- that nothing in this file compiles. The Ogg/OAL list below is
+# built on every platform, emscripten included; those sources are named here
+# only so the unused backend stays discoverable.
+add_subdirectory(dependencies/tremor tremor)
 
 	set (SRC ${SRC}
 		src/sound/OggStream.cpp
@@ -59,9 +50,6 @@ set(SRC
 		src/sound/oal/StaticStreamOAL.cpp
 		src/sound/oal/StaticStreamOAL.h
 		)
-
-#endif(EMSCRIPTEN)
-
 
 add_library(oxygine-sound STATIC ${SRC})
 if(EMSCRIPTEN)
@@ -109,7 +97,6 @@ endif(NOT EMSCRIPTEN)
 target_link_libraries(oxygine-sound PUBLIC ${OXYGINESOUND_LIBS})
 
 
-#target_link_libraries(oxyginemagicparticles)
 # The only directory a consumer ever saw: it now travels with the library as a
 # usage requirement instead of being copied into the parent scope as a string.
 target_include_directories(oxygine-sound PUBLIC src)
