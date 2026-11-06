@@ -53,14 +53,14 @@ add_subdirectory(dependencies/tremor tremor)
 
 add_library(oxygine-sound STATIC ${SRC})
 if(EMSCRIPTEN)
-	# The library itself is linked by name on the consumer's link line, so it
-	# does not belong in this list of extra libraries.
-	set(OXYGINESOUND_LIBS -lopenal tremor -logg)
+	# On this platform AL and Ogg arrive as linker libraries rather than as
+	# targets of this project; tremor is a target and is linked as one.
+	target_link_libraries(oxygine-sound PUBLIC -lopenal tremor -logg)
 
 else(EMSCRIPTEN)
 	if (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
 
-		set(OXYGINESOUND_LIBS -lopenal tremor -logg)
+		target_link_libraries(oxygine-sound PUBLIC -lopenal tremor -logg)
 
 	else()
 
@@ -72,10 +72,12 @@ else(EMSCRIPTEN)
 			endif()
 		endif()
 
-		set(OXYGINESOUND_LIBS
+		target_link_libraries(oxygine-sound PUBLIC
 			${CMAKE_CURRENT_SOURCE_DIR}/libs/win32/OpenAL32.lib
 			${CMAKE_CURRENT_SOURCE_DIR}/libs/win32/${LIBOGG}.lib
-			tremor)
+			tremor
+			-lopenal
+			-logg)
 
 	endif()
 endif(EMSCRIPTEN)
@@ -86,15 +88,6 @@ endif(EMSCRIPTEN)
 # PUBLIC keyword says the same thing and is required here because a target
 # linked with the keyword signature cannot also be linked with the plain one.
 target_link_libraries(oxygine-sound PUBLIC oxygine-framework)
-target_link_libraries(oxygine-sound PUBLIC -lopenal)
-if (NOT EMSCRIPTEN)
-   target_link_libraries(oxygine-sound PUBLIC -logg)
-endif(NOT EMSCRIPTEN)
-
-# The extra libraries travel with the library as a usage requirement instead of
-# being exported to the parent scope as a string that every consumer had to
-# re-attach by hand.
-target_link_libraries(oxygine-sound PUBLIC ${OXYGINESOUND_LIBS})
 
 
 # The only directory a consumer ever saw: it now travels with the library as a
