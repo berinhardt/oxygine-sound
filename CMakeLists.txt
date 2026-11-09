@@ -52,9 +52,18 @@ add_subdirectory(dependencies/tremor tremor)
 
 add_library(oxygine-sound STATIC ${SRC})
 if(EMSCRIPTEN)
-	# On this platform AL and Ogg arrive as linker libraries rather than as
-	# targets of this project; tremor is a target and is linked as one.
-	target_link_libraries(oxygine-sound PUBLIC -lopenal tremor -logg)
+	# On this platform AL still arrives as a plain -l name rather than as a
+	# target of this project, and tremor is a target and is linked as one. Ogg
+	# is neither any more: it is requested as emcc's ogg port, which supplies
+	# both its headers and libogg.a. The port is asked for on both lines
+	# because the two lines do different work -- emcc installs a port's headers
+	# from the compile path, and src/sound/OggStream.cpp (in the SRC list
+	# above) includes ogg/ogg.h on this platform too, so the compile copy is
+	# what puts that header in the sysroot, while the link copy is what adds
+	# libogg.a to the link.
+	target_link_libraries(oxygine-sound PUBLIC -lopenal tremor)
+	target_compile_options(oxygine-sound PRIVATE -sUSE_OGG=1)
+	target_link_options(oxygine-sound PUBLIC -sUSE_OGG=1)
 
 else(EMSCRIPTEN)
 	if (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
