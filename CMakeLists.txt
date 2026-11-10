@@ -89,10 +89,23 @@ elseif(ANDROID)
 		dependencies/libogg/include)
 
 	# Android.mk wrapped openal, libogg and tremor in
-	# LOCAL_WHOLE_STATIC_LIBRARIES. Every symbol they export is referenced
-	# directly from oxygine-sound's own objects, so a plain link pulls the same
-	# objects and -Wl,--whole-archive is not needed.
-	target_link_libraries(oxygine-sound PUBLIC openal tremor libogg OpenSLES dl log)
+	# LOCAL_WHOLE_STATIC_LIBRARIES, and that is still required: OpenAL
+	# registers its ring-buffer helpers (CreateRingBuffer, DestroyRingBuffer,
+	# RingBufferSize, WriteRingBuffer, ReadRingBuffer) through internal
+	# function pointers, so no object of theirs is referenced directly and a
+	# plain link drops them.
+	#
+	# The bracketing is asked for through the linker's push/pop state rather
+	# than "-Wl,--whole-archive"/"-Wl,--no-whole-archive": CMake deduplicates
+	# identical link items, and the plain pair is already present in
+	# oxygine-framework's interface, so the two pairs collapse into a single
+	# one placed after libSDL2.so where it wraps nothing. Distinct spellings
+	# keep each pair next to the libraries it applies to; this is the same
+	# spelling CMake's own WHOLE_ARCHIVE link feature emits.
+	target_link_libraries(oxygine-sound PUBLIC
+		"-Wl,--push-state,--whole-archive" openal tremor libogg
+		"-Wl,--pop-state"
+		OpenSLES dl log)
 
 else(EMSCRIPTEN)
 	if (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
