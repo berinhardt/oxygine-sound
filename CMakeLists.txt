@@ -65,6 +65,35 @@ if(EMSCRIPTEN)
 	target_compile_options(oxygine-sound PRIVATE -sUSE_OGG=1)
 	target_link_options(oxygine-sound PUBLIC -sUSE_OGG=1)
 
+elseif(ANDROID)
+	# Android has neither library available as a plain name. OpenAL is a
+	# per-ABI prebuilt static archive -- the exact one Android.mk links -- and it
+	# is not in the tree for every ABI, so a missing archive has to fail here
+	# rather than at link time. Ogg is built from source here, from the same two
+	# files Android.mk compiles; tremor is built above on every platform.
+	add_subdirectory(dependencies/libogg libogg)
+
+	set(ANDROID_OPENAL_LIB
+		${CMAKE_CURRENT_SOURCE_DIR}/dependencies/openal-android/obj/local/${ANDROID_ABI}/libopenal.a)
+	if(NOT EXISTS ${ANDROID_OPENAL_LIB})
+		message(FATAL_ERROR
+			"Missing prebuilt OpenAL for ${ANDROID_ABI}: ${ANDROID_OPENAL_LIB}")
+	endif()
+	add_library(openal STATIC IMPORTED)
+	set_target_properties(openal PROPERTIES IMPORTED_LOCATION ${ANDROID_OPENAL_LIB})
+
+	# src/sound/OggStream.cpp includes ogg/ogg.h and the oal sources include
+	# AL/al.h, so both directories have to be on the include path.
+	target_include_directories(oxygine-sound PRIVATE
+		dependencies/openal-android/jni/OpenAL/include
+		dependencies/libogg/include)
+
+	# Android.mk wrapped openal, libogg and tremor in
+	# LOCAL_WHOLE_STATIC_LIBRARIES. Every symbol they export is referenced
+	# directly from oxygine-sound's own objects, so a plain link pulls the same
+	# objects and -Wl,--whole-archive is not needed.
+	target_link_libraries(oxygine-sound PUBLIC openal tremor libogg OpenSLES dl log)
+
 else(EMSCRIPTEN)
 	if (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
 
