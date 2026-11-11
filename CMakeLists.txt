@@ -93,6 +93,22 @@ elseif(ANDROID)
 		dependencies/openal-android/jni/OpenAL/include
 		dependencies/libogg/include)
 
+	# Android.mk reached the framework headers through
+	# '$(LOCAL_PATH)/../oxygine-framework/oxygine/src/', listed in
+	# LOCAL_C_INCLUDES. ndk-build therefore recorded that spelling in __FILE__
+	# for the framework headers this module includes, relative to the module's
+	# own directory (e.g.
+	# '../../deps/oxygine-sound/../oxygine-framework/oxygine/src/oxygine/...').
+	# The inherited include directory is the collapsed absolute one, which the
+	# root prefix map rewrites to '../../deps/oxygine-framework/oxygine/src/...'.
+	# The literal lives in this module's own translation units, so a PRIVATE
+	# directory is enough; BEFORE puts it ahead of the inherited collapsed
+	# directory, so clang opens the header through the spelling ndk-build used.
+	# The include directory alone is sufficient: no matching prefix map is
+	# needed.
+	target_include_directories(oxygine-sound BEFORE PRIVATE
+		"${CMAKE_CURRENT_SOURCE_DIR}/../oxygine-framework/oxygine/src")
+
 	# Android.mk wrapped openal, libogg and tremor in
 	# LOCAL_WHOLE_STATIC_LIBRARIES, and that is still required: OpenAL
 	# registers its ring-buffer helpers (CreateRingBuffer, DestroyRingBuffer,
