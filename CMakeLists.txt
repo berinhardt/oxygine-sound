@@ -1,6 +1,11 @@
 cmake_minimum_required (VERSION 3.16)
 
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11")
+# Android keeps clang's default C++ dialect: the ndk-build baseline compiled
+# this module at that default, and a byte comparison of the two builds needs
+# the same codegen. The Emscripten and native graphs keep the C++11 pin.
+if (NOT ANDROID)
+   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11")
+endif()
 
 set(SRC
 	src/sound/ResSound.cpp
