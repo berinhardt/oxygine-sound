@@ -59,6 +59,10 @@ add_subdirectory(dependencies/tremor tremor)
 
 add_library(oxygine-sound STATIC ${SRC})
 if (ANDROID)
+	# Android.mk's LOCAL_CFLAGS and LOCAL_EXPORT_CFLAGS: the define is on this
+	# module's own TUs and on every consumer's (main's compile line had it).
+	target_compile_definitions(oxygine-sound PRIVATE OXYGINE_SOUND=1)
+	target_compile_definitions(oxygine-sound INTERFACE OXYGINE_SOUND=1)
 	# Android.mk compiles src/sound/SoundHandle.cpp too (17 objects). The file
 	# is an empty namespace, so it adds no symbol, but the archive member list
 	# is part of the parity gate.
