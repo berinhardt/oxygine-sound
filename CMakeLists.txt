@@ -109,24 +109,23 @@ elseif(ANDROID)
 	target_include_directories(oxygine-sound BEFORE PRIVATE
 		"${CMAKE_CURRENT_SOURCE_DIR}/../oxygine-framework/oxygine/src")
 
-	# Android.mk wrapped openal, libogg and tremor in
-	# LOCAL_WHOLE_STATIC_LIBRARIES, and that is still required: OpenAL
-	# registers its ring-buffer helpers (CreateRingBuffer, DestroyRingBuffer,
-	# RingBufferSize, WriteRingBuffer, ReadRingBuffer) through internal
-	# function pointers, so no object of theirs is referenced directly and a
-	# plain link drops them.
-	#
-	# The bracketing is asked for through the linker's push/pop state rather
-	# than "-Wl,--whole-archive"/"-Wl,--no-whole-archive": CMake deduplicates
-	# identical link items, and the plain pair is already present in
-	# oxygine-framework's interface, so the two pairs collapse into a single
-	# one placed after libSDL2.so where it wraps nothing. Distinct spellings
-	# keep each pair next to the libraries it applies to; this is the same
-	# spelling CMake's own WHOLE_ARCHIVE link feature emits.
-	target_link_libraries(oxygine-sound PUBLIC
-		"-Wl,--push-state,--whole-archive" openal tremor libogg
-		"-Wl,--pop-state"
-		OpenSLES dl log)
+	# Android.mk put openal, libogg and tremor in the main module's
+	# LOCAL_WHOLE_STATIC_LIBRARIES, and ndk-build emits that whole-archive
+	# block ahead of the ordinary static libraries (build/core/
+	# default-build-commands.mk: objects, link-whole-archives, static libs,
+	# shared libs). A whole-archive pair declared here can only ever be
+	# emitted at this module's position in the link, after the selective
+	# archives, so it lays the blocks out in an order ndk-build never
+	# produced. The ordering decision belongs to the module that owns the
+	# link line: the main module names all three archives in its own ordered
+	# whole-archive group (which is still required -- OpenAL registers its
+	# ring-buffer helpers, CreateRingBuffer, DestroyRingBuffer,
+	# RingBufferSize, WriteRingBuffer and ReadRingBuffer, through internal
+	# function pointers, so a plain link drops them). Only the platform
+	# libraries stay here. The targets above are kept so the main module can
+	# name them, and the include directories below still reach this module's
+	# compile lines.
+	target_link_libraries(oxygine-sound PUBLIC OpenSLES dl log)
 
 else(EMSCRIPTEN)
 	if (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
