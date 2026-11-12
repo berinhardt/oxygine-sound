@@ -7,7 +7,14 @@ if (NOT ANDROID)
    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11")
 endif()
 
+# Android.mk hands the compiler its sources in the order LOCAL_SRC_FILES lists
+# them, the archiver keeps that member order, and the final link layout follows
+# it, so the sequence below is Android.mk's rather than a folder-by-folder one.
 set(SRC
+	src/sound/MemoryStream.cpp
+	src/sound/MemoryStream.h
+	src/sound/OggStream.cpp
+	src/sound/OggStream.h
 	src/sound/ResSound.cpp
 	src/sound/ResSound.h
 	src/sound/Sound.h
@@ -17,42 +24,37 @@ set(SRC
 	src/sound/SoundPlayer.h
 	src/sound/SoundSystem.cpp
 	src/sound/SoundSystem.h
-
-	src/sound/null/SoundSystemNull.cpp
-	src/sound/null/SoundSystemNull.h
-	src/sound/null/SoundNull.cpp
-	src/sound/null/SoundNull.h
-	src/sound/null/SoundHandleNull.cpp
-	src/sound/null/SoundHandleNull.h
+	src/sound/WavStream.cpp
+	src/sound/WavStream.h
 	)
 
 # src/sound/emscripten/ holds an alternative emscripten backend --
 # SoundEmscripten, SoundHandleEmscripten, SoundSystemEmscripten and their
-# headers -- that nothing in this file compiles. The Ogg/OAL list below is
-# built on every platform, emscripten included; those sources are named here
-# only so the unused backend stays discoverable.
+# headers -- that nothing in this file compiles. The OAL and null lists below
+# are built on every platform, emscripten included; those sources are named
+# here only so the unused backend stays discoverable.
 add_subdirectory(dependencies/tremor tremor)
 
 	set (SRC ${SRC}
-		src/sound/OggStream.cpp
-		src/sound/OggStream.h
-		src/sound/MemoryStream.cpp
-		src/sound/MemoryStream.h
-		src/sound/WavStream.cpp
-		src/sound/WavStream.h
-
 		src/sound/oal/SoundHandleOAL.cpp
 		src/sound/oal/SoundHandleOAL.h
 		src/sound/oal/SoundOAL.cpp
 		src/sound/oal/SoundOAL.h
 		src/sound/oal/SoundSystemOAL.cpp
 		src/sound/oal/SoundSystemOAL.h
-		src/sound/oal/StreamingSoundHandleOAL.cpp
-		src/sound/oal/StreamingSoundHandleOAL.h
 		src/sound/oal/StaticSoundHandleOAL.cpp
 		src/sound/oal/StaticSoundHandleOAL.h
 		src/sound/oal/StaticStreamOAL.cpp
 		src/sound/oal/StaticStreamOAL.h
+		src/sound/oal/StreamingSoundHandleOAL.cpp
+		src/sound/oal/StreamingSoundHandleOAL.h
+
+		src/sound/null/SoundSystemNull.cpp
+		src/sound/null/SoundSystemNull.h
+		src/sound/null/SoundNull.cpp
+		src/sound/null/SoundNull.h
+		src/sound/null/SoundHandleNull.cpp
+		src/sound/null/SoundHandleNull.h
 		)
 
 add_library(oxygine-sound STATIC ${SRC})
