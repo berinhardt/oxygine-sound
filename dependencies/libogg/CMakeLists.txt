@@ -8,4 +8,9 @@ add_library(libogg STATIC
 	src/framing.c
 	src/bitwise.c)
 
+# ndk-build's module is `libogg` but its archive is libogg.a (the module name
+# already carries the prefix, and the make build does not add a second one);
+# CMake would name this liblibogg.a. The gate compares archive names.
+set_target_properties(libogg PROPERTIES OUTPUT_NAME ogg)
+
 target_include_directories(libogg PUBLIC include)

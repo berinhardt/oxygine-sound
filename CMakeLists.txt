@@ -58,6 +58,12 @@ add_subdirectory(dependencies/tremor tremor)
 		)
 
 add_library(oxygine-sound STATIC ${SRC})
+if (ANDROID)
+	# Android.mk compiles src/sound/SoundHandle.cpp too (17 objects). The file
+	# is an empty namespace, so it adds no symbol, but the archive member list
+	# is part of the parity gate.
+	target_sources(oxygine-sound PRIVATE src/sound/SoundHandle.cpp)
+endif()
 if(EMSCRIPTEN)
 	# On this platform AL still arrives as a plain -l name rather than as a
 	# target of this project, and tremor is a target and is linked as one. Ogg
@@ -110,6 +116,8 @@ elseif(ANDROID)
 	# needed.
 	target_include_directories(oxygine-sound BEFORE PRIVATE
 		"${CMAKE_CURRENT_SOURCE_DIR}/../oxygine-framework/oxygine/src")
+	target_include_directories(oxygine-sound BEFORE PRIVATE
+		"${CMAKE_CURRENT_SOURCE_DIR}/../glm/")
 
 	# Android.mk put openal, libogg and tremor in the main module's
 	# LOCAL_WHOLE_STATIC_LIBRARIES, and ndk-build emits that whole-archive
