@@ -12,6 +12,12 @@ LOCAL_C_INCLUDES := $(LOCAL_PATH)/$(OPENAL_DIR) \
 					$(LOCAL_PATH)/$(OPENAL_DIR)/include \
 					$(LOCAL_PATH)/$(OPENAL_DIR)/OpenAL32/Include \
  
+# This 2010-era code predates C99 error semantics. Modern clang (NDK 26+)
+# rejects implicit function declarations (e.g. bzero in opensles.c) as errors;
+# they still resolve against the NDK headers, so keep them as warnings.
+# apportable_openal_funcs.h defines a tentative global in a header, which both
+# android.c and audiotrack.c include. The prebuilt was built when tentative
+# definitions merged; -fcommon restores that same single-symbol behaviour.
 LOCAL_CFLAGS    +=  -DAL_ALEXT_PROTOTYPES \
                     -DANDROID \
                     -fpic \
@@ -22,7 +28,9 @@ LOCAL_CFLAGS    +=  -DAL_ALEXT_PROTOTYPES \
                     -DHAVE_GCC_VISIBILITY \
                     -O3 \
                     -g \
- 
+                    -Wno-error=implicit-function-declaration \
+                    -fcommon \
+
 
 MAX_SOURCES_LOW ?= 4
 MAX_SOURCES_START ?= 8
