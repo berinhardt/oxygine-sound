@@ -29,6 +29,84 @@
 
 #include "apportable_openal_funcs.h"
 
+#ifdef CLIENTE_OPENAL_STALL_PROBE
+#include <sys/system_properties.h>
+#include "stall_probe.h"
+
+/* Debug-only audio-sink stall (ticket 02, ADR 0001).
+ *
+ * The real trigger is an audio server that stops draining the track, which we
+ * cannot invoke from outside the app. This switch simulates the same sink
+ * behaviour from inside the backend: while it is set, a blocking write parks
+ * the mixer thread for `debug_stall_ms` (like AudioTrack.write() on a wedged
+ * server) and a non-blocking write reports a full sink (returns 0), so the fix
+ * in tickets 03/04 has a reproducible red/green signal.
+ *
+ * Compiled only when CLIENTE_OPENAL_STALL_PROBE is defined; the release build
+ * type does not define it. For a debug app build, enable it at runtime with:
+ *
+ *     adb shell setprop debug.openal.audiotrack_stall_ms 8000
+ *
+ * and clear it with `setprop ... 0`.
+ */
+#define STALL_PROPERTY "debug.openal.audiotrack_stall_ms"
+#define STALL_MAX_MS 600000u
+
+static volatile unsigned int debug_stall_ms = 0;
+/* Non-zero once the mixer thread has attempted a write against the simulated
+ * stalled sink. Sticky for the life of the process (reset on playback reset) so
+ * a probe can synchronise whether the write blocks or reports a full sink. */
+static volatile int debug_stall_active = 0;
+/* Set when a test harness calls alc_android_test_set_stall_ms(). The system
+ * property must then not override the test's choice (the property is for a
+ * debug app build, not for the probe). */
+static volatile int debug_stall_override = 0;
+
+static unsigned int debug_parse_stall_ms(const char *value)
+{
+    char *end = NULL;
+    unsigned long ms;
+
+    if (value == NULL || value[0] == '\0')
+    {
+        return 0;
+    }
+    ms = strtoul(value, &end, 10);
+    if (end == value || ms > STALL_MAX_MS)
+    {
+        return 0;
+    }
+    return (unsigned int)ms;
+}
+
+static void debug_stall_refresh_from_property(void)
+{
+    char value[PROP_VALUE_MAX];
+
+    if (debug_stall_override)
+    {
+        return;
+    }
+
+    value[0] = '\0';
+    if (__system_property_get(STALL_PROPERTY, value) > 0)
+    {
+        debug_stall_ms = debug_parse_stall_ms(value);
+    }
+}
+
+void alc_android_test_set_stall_ms(unsigned int ms)
+{
+    debug_stall_ms = (ms <= STALL_MAX_MS) ? ms : 0;
+    debug_stall_override = 1;
+}
+
+int alc_android_test_stall_active(void)
+{
+    return debug_stall_active;
+}
+#endif
+
 static const ALCchar android_device[] = "Android Default";
 
 JavaVM* alcGetJavaVM(void);
@@ -60,6 +138,40 @@ typedef struct
 #define ENCODING_PCM_8BIT 3
 #define ENCODING_PCM_16BIT 2
 #define MODE_STREAM 1
+
+/* All mixer writes go through here. The debug stall switch turns this call
+ * into the shape of a sink that has stopped accepting data:
+ *   - blocking write (nonBlocking == 0): park for the stall window, like
+ *     AudioTrack.write() on a wedged audio server;
+ *   - non-blocking write (nonBlocking != 0): report a full sink immediately so
+ *     the loop can re-test `running` (ticket 03).
+ * In a release build neither branch exists and this is exactly the old
+ * CallNonvirtualIntMethod(mWrite) call. */
+static jint audiotrack_write(AndroidData *data, jobject track, jarray buffer,
+                             int bufferSizeInBytes, int nonBlocking)
+{
+    (void)data;
+#ifdef CLIENTE_OPENAL_STALL_PROBE
+    if (debug_stall_ms > 0)
+    {
+        debug_stall_active = 1;
+        if (nonBlocking)
+        {
+            return 0;
+        }
+
+        usleep(debug_stall_ms * 1000u);
+
+        /* The buffer is intentionally discarded: the sink was not draining. */
+        return bufferSizeInBytes;
+    }
+#else
+    (void)nonBlocking;
+#endif
+
+    return (*env)->CallNonvirtualIntMethod(env, track, cAudioTrack, mWrite,
+                                           buffer, 0, bufferSizeInBytes);
+}
 
 static void* thread_function(void* arg)
 {
@@ -125,7 +237,7 @@ static void* thread_function(void* arg)
             aluMixData(device, pBuffer, bufferSizeInSamples);
             (*env)->ReleasePrimitiveArrayCritical(env, buffer, pBuffer, 0);
 
-            (*env)->CallNonvirtualIntMethod(env, track, cAudioTrack, mWrite, buffer, 0, bufferSizeInBytes);
+            audiotrack_write(data, track, buffer, bufferSizeInBytes, 0);
         }
         else
         {
@@ -214,6 +326,11 @@ static ALCboolean android_reset_playback(ALCdevice *device)
     // }
 
     SetDefaultChannelOrder(device);
+
+#ifdef CLIENTE_OPENAL_STALL_PROBE
+    debug_stall_refresh_from_property();
+    debug_stall_active = 0;
+#endif
 
     data->running = 1;
     pthread_create(&data->thread, NULL, thread_function, device);
