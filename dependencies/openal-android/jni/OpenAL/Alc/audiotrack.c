@@ -51,17 +51,25 @@
  * and clear it with `setprop ... 0`.
  */
 #define STALL_PROPERTY "debug.openal.audiotrack_stall_ms"
+#define STALL_OUTSIDE_PROPERTY "debug.openal.audiotrack_stall_outside_ms"
 #define STALL_MAX_MS 600000u
 
 static volatile unsigned int debug_stall_ms = 0;
-/* Non-zero once the mixer thread has attempted a write against the simulated
- * stalled sink. Sticky for the life of the process (reset on playback reset) so
- * a probe can synchronise whether the write blocks or reports a full sink. */
+/* Second stall shape (ticket 04): park the mixer thread *outside*
+ * audiotrack_write, immediately before the JNI write call. A real wedge inside
+ * AudioTrack.write is covered by the first switch; this one exercises the
+ * bounded join when the thread is blocked anywhere else, so a timed-out join
+ * and the ownership transfer are the paths actually taken. */
+static volatile unsigned int debug_stall_outside_ms = 0;
+/* Non-zero once the mixer thread has reached either simulated stall. Sticky for
+ * the life of the process (reset on playback reset) so a probe can synchronise
+ * with the thread. */
 static volatile int debug_stall_active = 0;
-/* Set when a test harness calls alc_android_test_set_stall_ms(). The system
- * property must then not override the test's choice (the property is for a
- * debug app build, not for the probe). */
+/* Set when a test harness calls the corresponding setter. The system property
+ * must then not override the test's choice (the property is for a debug app
+ * build, not for the probe). */
 static volatile int debug_stall_override = 0;
+static volatile int debug_stall_outside_override = 0;
 
 static unsigned int debug_parse_stall_ms(const char *value)
 {
@@ -84,15 +92,22 @@ static void debug_stall_refresh_from_property(void)
 {
     char value[PROP_VALUE_MAX];
 
-    if (debug_stall_override)
+    if (!debug_stall_override)
     {
-        return;
+        value[0] = '\0';
+        if (__system_property_get(STALL_PROPERTY, value) > 0)
+        {
+            debug_stall_ms = debug_parse_stall_ms(value);
+        }
     }
 
-    value[0] = '\0';
-    if (__system_property_get(STALL_PROPERTY, value) > 0)
+    if (!debug_stall_outside_override)
     {
-        debug_stall_ms = debug_parse_stall_ms(value);
+        value[0] = '\0';
+        if (__system_property_get(STALL_OUTSIDE_PROPERTY, value) > 0)
+        {
+            debug_stall_outside_ms = debug_parse_stall_ms(value);
+        }
     }
 }
 
@@ -100,6 +115,12 @@ void alc_android_test_set_stall_ms(unsigned int ms)
 {
     debug_stall_ms = (ms <= STALL_MAX_MS) ? ms : 0;
     debug_stall_override = 1;
+}
+
+void alc_android_test_set_outside_stall_ms(unsigned int ms)
+{
+    debug_stall_outside_ms = (ms <= STALL_MAX_MS) ? ms : 0;
+    debug_stall_outside_override = 1;
 }
 
 int alc_android_test_stall_active(void)
@@ -288,6 +309,18 @@ static void* thread_function(void* arg)
 
             aluMixData(device, pBuffer, bufferSizeInSamples);
             (*env)->ReleasePrimitiveArrayCritical(env, buffer, pBuffer, 0);
+
+#ifdef CLIENTE_OPENAL_STALL_PROBE
+            /* Ticket 04 stall shape: block outside audiotrack_write. The
+             * thread is wedged before the JNI call, so the bounded join must
+             * time out, detach, and leave the track/JNI state to this thread
+             * until it wakes and exits. */
+            if (debug_stall_outside_ms > 0)
+            {
+                debug_stall_active = 1;
+                usleep(debug_stall_outside_ms * 1000u);
+            }
+#endif
 
             /* Never block on the sink: if it cannot take the whole chunk, the
              * remainder is dropped and the thread re-tests `running` after at

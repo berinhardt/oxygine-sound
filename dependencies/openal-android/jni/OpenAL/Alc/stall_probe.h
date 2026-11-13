@@ -22,6 +22,11 @@ extern "C" {
  * accepting data for `ms` milliseconds. 0 disables the simulation. */
 void alc_android_test_set_stall_ms(unsigned int ms);
 
+/* Block the mixer thread for `ms` milliseconds *outside* audiotrack_write,
+ * immediately before the JNI write call. Exercises the timed-out join and the
+ * ownership transfer (ticket 04). 0 disables the simulation. */
+void alc_android_test_set_outside_stall_ms(unsigned int ms);
+
 /* Non-zero once the mixer thread has attempted a write against the simulated
  * stalled sink (whether the write blocked or reported a full sink). */
 int alc_android_test_stall_active(void);
