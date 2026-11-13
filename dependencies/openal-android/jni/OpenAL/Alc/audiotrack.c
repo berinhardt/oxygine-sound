@@ -22,6 +22,7 @@
 
 #include <stdlib.h>
 #include <unistd.h>
+#include <time.h>
 #include <jni.h>
 #include <pthread.h>
 #include "alMain.h"
@@ -29,6 +30,11 @@
 #include "AL/alc.h"
 
 #include "apportable_openal_funcs.h"
+
+/* Number of mixer threads that have been started and not yet returned. Used to
+ * keep the process-lifetime JNI state alive while a thread detached by a
+ * timed-out join can still touch it (ticket 04). */
+static volatile int mixer_threads_alive = 0;
 
 #ifdef CLIENTE_OPENAL_STALL_PROBE
 #include <sys/system_properties.h>
@@ -127,6 +133,20 @@ int alc_android_test_stall_active(void)
 {
     return debug_stall_active;
 }
+
+/* Ticket 04 test seams: how many joins timed out (the thread was detached and
+ * took ownership), and how many mixer threads are still alive. */
+static volatile int debug_detach_count = 0;
+
+int alc_android_test_detach_count(void)
+{
+    return debug_detach_count;
+}
+
+int alc_android_test_live_mixer_threads(void)
+{
+    return mixer_threads_alive;
+}
 #endif
 
 static const ALCchar android_device[] = "Android Default";
@@ -153,6 +173,27 @@ typedef struct
 {
     pthread_t thread;
     volatile int running;
+
+    /* Snapshot of the ALCdevice fields the mixer thread needs. On a timed-out
+     * join the thread outlives alcDestroyContext()/alcCloseDevice(), so after
+     * the detach it must not dereference the ALCdevice at all (ADR 0001). */
+    ALCdevice *device;
+    unsigned int frequency;
+    unsigned int frameSize;
+    unsigned int bytesPerSecond;
+    int sampleRateInHz;
+    int channelConfig;
+    int audioFormat;
+    int numUpdates;
+
+    /* Ownership handshake (ticket 04). When `detached` is set the mixer thread
+     * owns this struct (and its AudioTrack/JNI state) until it exits, and
+     * android_close_playback() must not free it. */
+    pthread_mutex_t lock;
+    pthread_cond_t exited;
+    int thread_started;
+    int detached;
+    int thread_exited;
 } AndroidData;
 
 #define STREAM_MUSIC 3
@@ -163,6 +204,47 @@ typedef struct
 #define MODE_STREAM 1
 /* android.media.AudioTrack.WRITE_NON_BLOCKING (API 23+). */
 #define WRITE_NON_BLOCKING 1
+
+/* How long teardown waits for the mixer thread before detaching it and letting
+ * teardown continue (ADR 0001: low hundreds of milliseconds). */
+#define AUDIOTRACK_JOIN_TIMEOUT_MS 200
+
+/* The mixer loop's worst-case observation latency is one pacing sleep. It must
+ * stay below the join budget, or every normal shutdown would take the detach
+ * path. 20 ms gives a 10x margin. */
+#define AUDIOTRACK_PACE_MAX_USEC 20000u
+#if (AUDIOTRACK_PACE_MAX_USEC / 1000u) >= AUDIOTRACK_JOIN_TIMEOUT_MS
+#error "pacing sleep must stay below the audiotrack join budget"
+#endif
+
+static AndroidData *android_data_alloc(void)
+{
+    AndroidData *data = (AndroidData*)calloc(1, sizeof(*data));
+
+    if (data != NULL)
+    {
+        pthread_condattr_t attr;
+
+        pthread_mutex_init(&data->lock, NULL);
+        pthread_condattr_init(&attr);
+        /* Use a monotonic clock for the bounded wait so a wall-clock change
+         * cannot stretch or collapse the join budget. */
+        pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+        pthread_cond_init(&data->exited, &attr);
+        pthread_condattr_destroy(&attr);
+    }
+    return data;
+}
+
+static void android_data_free(AndroidData *data)
+{
+    if (data != NULL)
+    {
+        pthread_cond_destroy(&data->exited);
+        pthread_mutex_destroy(&data->lock);
+        free(data);
+    }
+}
 
 /* All mixer writes go through here. With `nonBlocking` set this is the
  * AudioTrack.write(byte[], int, int, WRITE_NON_BLOCKING) overload: it returns
@@ -179,8 +261,9 @@ typedef struct
  *     the loop can re-test `running` (ticket 03).
  * In a release build neither stall branch exists; the non-blocking overload is
  * used like any other write. */
-static jint audiotrack_write(AndroidData *data, jobject track, jarray buffer,
-                             int bufferSizeInBytes, int nonBlocking)
+static jint audiotrack_write(JNIEnv *jniEnv, AndroidData *data, jobject track,
+                             jarray buffer, int bufferSizeInBytes,
+                             int nonBlocking)
 {
     (void)data;
 #ifdef CLIENTE_OPENAL_STALL_PROBE
@@ -201,64 +284,98 @@ static jint audiotrack_write(AndroidData *data, jobject track, jarray buffer,
 
     if (nonBlocking)
     {
-        return (*env)->CallNonvirtualIntMethod(env, track, cAudioTrack,
-                                               mWriteNonBlocking,
-                                               buffer, 0, bufferSizeInBytes,
-                                               WRITE_NON_BLOCKING);
+        return (*jniEnv)->CallNonvirtualIntMethod(jniEnv, track, cAudioTrack,
+                                                  mWriteNonBlocking,
+                                                  buffer, 0, bufferSizeInBytes,
+                                                  WRITE_NON_BLOCKING);
     }
 
-    return (*env)->CallNonvirtualIntMethod(env, track, cAudioTrack, mWrite,
-                                           buffer, 0, bufferSizeInBytes);
+    return (*jniEnv)->CallNonvirtualIntMethod(jniEnv, track, cAudioTrack, mWrite,
+                                              buffer, 0, bufferSizeInBytes);
 }
 
 /* A non-blocking write cannot pace the mixer any more: when the sink is full
  * the write returns immediately and the loop would spin, mixing buffers as
  * fast as the CPU allows and dropping all of them. Sleep for the play time of
  * the bytes that were not accepted so we keep producing audio at the sink's
- * rate without ever waiting for the sink itself. The sleep is bounded by the
- * buffer length (a few ms), so shutdown is still observed on the next loop
- * iteration. */
-static void audiotrack_pace_dropped(const ALCdevice *device,
+ * rate without ever waiting for the sink itself.
+ *
+ * The sleep is capped at AUDIOTRACK_PACE_MAX_USEC, which also bounds how long
+ * the mixer can go without observing `running`; it must stay below the join
+ * budget (ticket 04). The ALCdevice fields are read from the AndroidData
+ * snapshot because this can run after a timed-out join freed the device. */
+static void audiotrack_pace_dropped(const AndroidData *data,
                                     unsigned int unwrittenBytes)
 {
-    unsigned int bytesPerSecond =
-        (unsigned int)device->Frequency *
-        (unsigned int)FrameSizeFromDevFmt(device->FmtChans, device->FmtType);
     unsigned int usec;
 
-    if (bytesPerSecond == 0 || unwrittenBytes == 0)
+    if (data->bytesPerSecond == 0 || unwrittenBytes == 0)
     {
         return;
     }
 
     usec = (unsigned int)((unsigned long long)unwrittenBytes * 1000000ull /
-                          bytesPerSecond);
+                          data->bytesPerSecond);
     if (usec == 0)
     {
         usec = 1;
     }
-    if (usec > 1000000u)
+    if (usec > AUDIOTRACK_PACE_MAX_USEC)
     {
-        usec = 1000000u;
+        usec = AUDIOTRACK_PACE_MAX_USEC;
     }
     usleep(usec);
 }
 
+static void android_mixer_thread_exit(AndroidData *data)
+{
+    int detached;
+
+    pthread_mutex_lock(&data->lock);
+    data->thread_exited = 1;
+    detached = data->detached;
+    pthread_cond_signal(&data->exited);
+    pthread_mutex_unlock(&data->lock);
+
+    mixer_threads_alive--;
+
+    /* A timed-out join handed ownership to this thread: release the struct
+     * ourselves. Otherwise the stopper (which observes thread_exited and
+     * detaches) and android_close_playback() still own it. */
+    if (detached)
+    {
+        android_data_free(data);
+    }
+}
+
 static void* thread_function(void* arg)
 {
-    ALCdevice* device = (ALCdevice*)arg;
-    AndroidData* data = (AndroidData*)device->ExtraData;
-    
+    AndroidData* data = (AndroidData*)arg;
+    ALCdevice* device = data->device;
     JavaVM *javaVM = alcGetJavaVM();
-    (*javaVM)->AttachCurrentThread(javaVM, &env, NULL);
+    JNIEnv *threadEnv = NULL;
+    jobject track;
+    jarray buffer;
+    int sampleRateInHz;
+    int channelConfig;
+    int audioFormat;
+    int bufferSizeInBytes;
+    int bufferSizeInSamples;
 
-    (*env)->PushLocalFrame(env, 2);
+    if ((*javaVM)->AttachCurrentThread(javaVM, &threadEnv, NULL) != JNI_OK ||
+        threadEnv == NULL)
+    {
+        android_mixer_thread_exit(data);
+        return NULL;
+    }
 
-    int sampleRateInHz = device->Frequency;
-    int channelConfig = ChannelsFromDevFmt(device->FmtChans) == 1 ? CHANNEL_CONFIGURATION_MONO : CHANNEL_CONFIGURATION_STEREO;
-    int audioFormat = BytesFromDevFmt(device->FmtType) == 1 ? ENCODING_PCM_8BIT : ENCODING_PCM_16BIT;
+    (*threadEnv)->PushLocalFrame(threadEnv, 2);
 
-    int bufferSizeInBytes = (*env)->CallStaticIntMethod(env, cAudioTrack,
+    sampleRateInHz = data->sampleRateInHz;
+    channelConfig = data->channelConfig;
+    audioFormat = data->audioFormat;
+
+    bufferSizeInBytes = (*threadEnv)->CallStaticIntMethod(threadEnv, cAudioTrack,
         mGetMinBufferSize, sampleRateInHz, channelConfig, audioFormat);
 
     // Suggestion from Eric Wing <ewmailing@gmail.com>
@@ -275,40 +392,49 @@ static void* thread_function(void* arg)
        Dividing out the bufferSizeInSamples separately and skipping the multiply did not work.
        Omitting the multiply and not dividing did work, but the buffers may be unnecessarily large.
       */
-    bufferSizeInBytes = bufferSizeInBytes / device->NumUpdates;
+    bufferSizeInBytes = bufferSizeInBytes / data->numUpdates;
 
-    int bufferSizeInSamples = bufferSizeInBytes / FrameSizeFromDevFmt(device->FmtChans, device->FmtType);
+    bufferSizeInSamples = bufferSizeInBytes / (int)data->frameSize;
 
-    jobject track = (*env)->NewObject(env, cAudioTrack, mAudioTrack,
-        STREAM_MUSIC, sampleRateInHz, channelConfig, audioFormat, device->NumUpdates * bufferSizeInBytes, MODE_STREAM);
+    track = (*threadEnv)->NewObject(threadEnv, cAudioTrack, mAudioTrack,
+        STREAM_MUSIC, sampleRateInHz, channelConfig, audioFormat, data->numUpdates * bufferSizeInBytes, MODE_STREAM);
 
-    (*env)->CallNonvirtualVoidMethod(env, track, cAudioTrack, mPlay);
+    (*threadEnv)->CallNonvirtualVoidMethod(threadEnv, track, cAudioTrack, mPlay);
     audioTrackPlaying = 1;
 
-    jarray buffer = (*env)->NewByteArray(env, bufferSizeInBytes);
+    buffer = (*threadEnv)->NewByteArray(threadEnv, bufferSizeInBytes);
 
     while (data->running)
     {
         if (suspended) {
             if (audioTrackPlaying) {
-                (*env)->CallNonvirtualVoidMethod(env, track, cAudioTrack, mPause);
+                (*threadEnv)->CallNonvirtualVoidMethod(threadEnv, track, cAudioTrack, mPause);
                 audioTrackPlaying = 0;
             }
             usleep(5000);
             continue;
         } else if (!audioTrackPlaying) {
-            (*env)->CallNonvirtualVoidMethod(env, track, cAudioTrack, mPlay);
+            (*threadEnv)->CallNonvirtualVoidMethod(threadEnv, track, cAudioTrack, mPlay);
             audioTrackPlaying = 1;
         }
 
-        void* pBuffer = (*env)->GetPrimitiveArrayCritical(env, buffer, NULL);
+        void* pBuffer = (*threadEnv)->GetPrimitiveArrayCritical(threadEnv, buffer, NULL);
 
         if (pBuffer)
         {
             jint written;
 
+            /* The device is only valid while the joiner is still waiting. On a
+             * timed-out join the stopper has returned and may already have
+             * destroyed it, so re-test `running` before touching it. */
+            if (!data->running)
+            {
+                (*threadEnv)->ReleasePrimitiveArrayCritical(threadEnv, buffer, pBuffer, 0);
+                break;
+            }
+
             aluMixData(device, pBuffer, bufferSizeInSamples);
-            (*env)->ReleasePrimitiveArrayCritical(env, buffer, pBuffer, 0);
+            (*threadEnv)->ReleasePrimitiveArrayCritical(threadEnv, buffer, pBuffer, 0);
 
 #ifdef CLIENTE_OPENAL_STALL_PROBE
             /* Ticket 04 stall shape: block outside audiotrack_write. The
@@ -325,14 +451,15 @@ static void* thread_function(void* arg)
             /* Never block on the sink: if it cannot take the whole chunk, the
              * remainder is dropped and the thread re-tests `running` after at
              * most one buffer of pacing. */
-            written = audiotrack_write(data, track, buffer, bufferSizeInBytes, 1);
+            written = audiotrack_write(threadEnv, data, track, buffer,
+                                       bufferSizeInBytes, 1);
             if (written < 0)
             {
                 written = 0;
             }
             if ((int)written < bufferSizeInBytes)
             {
-                audiotrack_pace_dropped(device,
+                audiotrack_pace_dropped(data,
                                         (unsigned int)(bufferSizeInBytes - (int)written));
             }
         }
@@ -342,13 +469,15 @@ static void* thread_function(void* arg)
         }
     }
 
-    (*env)->CallNonvirtualVoidMethod(env, track, cAudioTrack, mStop);
-    (*env)->CallNonvirtualVoidMethod(env, track, cAudioTrack, mRelease);
+    (*threadEnv)->CallNonvirtualVoidMethod(threadEnv, track, cAudioTrack, mStop);
+    (*threadEnv)->CallNonvirtualVoidMethod(threadEnv, track, cAudioTrack, mRelease);
     audioTrackPlaying = 0;
 
-    (*env)->PopLocalFrame(env, NULL);
+    (*threadEnv)->PopLocalFrame(threadEnv, NULL);
 
     (*javaVM)->DetachCurrentThread(javaVM);
+
+    android_mixer_thread_exit(data);
     return NULL;
 }
 
@@ -357,8 +486,6 @@ static ALCboolean android_open_playback(ALCdevice *device, const ALCchar *device
     JavaVM *javaVM = alcGetJavaVM();
     (*javaVM)->AttachCurrentThread(javaVM, &env, NULL);
     AndroidData* data;
-    int channels;
-    int bytes;
 
     if (!cAudioTrack)
     {
@@ -394,7 +521,11 @@ static ALCboolean android_open_playback(ALCdevice *device, const ALCchar *device
         return ALC_FALSE;
     }
 
-    data = (AndroidData*)calloc(1, sizeof(*data));
+    data = android_data_alloc();
+    if (data == NULL)
+    {
+        return ALC_FALSE;
+    }
     device->szDeviceName = strdup(deviceName);
     device->ExtraData = data;
     return ALC_TRUE;
@@ -403,16 +534,39 @@ static ALCboolean android_open_playback(ALCdevice *device, const ALCchar *device
 static void android_close_playback(ALCdevice *device)
 {
     AndroidData* data = (AndroidData*)device->ExtraData;
-    if (data != NULL)
+    int can_free = 1;
+
+    if (data == NULL)
     {
-        free(data);
-        device->ExtraData = NULL;
+        return;
+    }
+
+    /* Never free the struct while the mixer thread can still touch it. The
+     * timeout path clears ExtraData and hands ownership to the thread, so a
+     * non-NULL thread_started here that has not exited is a programming error;
+     * leak rather than risk a use-after-free (ADR 0001, ticket 04). */
+    pthread_mutex_lock(&data->lock);
+    if (data->thread_started && !data->thread_exited)
+    {
+        can_free = 0;
+    }
+    pthread_mutex_unlock(&data->lock);
+
+    device->ExtraData = NULL;
+    if (can_free)
+    {
+        android_data_free(data);
+    }
+    else
+    {
+        AL_PRINT("android_close_playback: mixer thread still owns AndroidData");
     }
 }
 
 static ALCboolean android_reset_playback(ALCdevice *device)
 {
     AndroidData* data = (AndroidData*)device->ExtraData;
+    unsigned int numUpdates;
 
     // if (ChannelsFromDevFmt(device->FmtChans) >= 2)
     // {
@@ -430,8 +584,45 @@ static ALCboolean android_reset_playback(ALCdevice *device)
     debug_stall_active = 0;
 #endif
 
+    /* A timed-out stop handed the old struct to its detached thread and cleared
+     * ExtraData; start a fresh one rather than reusing memory the thread owns. */
+    if (data == NULL)
+    {
+        data = android_data_alloc();
+        if (data == NULL)
+        {
+            return ALC_FALSE;
+        }
+        device->ExtraData = data;
+    }
+
+    /* Snapshot everything the mixer thread reads from the device before it can
+     * outlive the device (ADR 0001, ticket 04). */
+    numUpdates = device->NumUpdates > 0 ? (unsigned int)device->NumUpdates : 1;
+    data->device = device;
+    data->frequency = (unsigned int)device->Frequency;
+    data->frameSize = (unsigned int)FrameSizeFromDevFmt(device->FmtChans, device->FmtType);
+    data->bytesPerSecond = data->frequency * data->frameSize;
+    data->sampleRateInHz = (int)data->frequency;
+    data->channelConfig = ChannelsFromDevFmt(device->FmtChans) == 1
+        ? CHANNEL_CONFIGURATION_MONO : CHANNEL_CONFIGURATION_STEREO;
+    data->audioFormat = BytesFromDevFmt(device->FmtType) == 1
+        ? ENCODING_PCM_8BIT : ENCODING_PCM_16BIT;
+    data->numUpdates = (int)numUpdates;
+
+    data->thread_started = 1;
+    data->detached = 0;
+    data->thread_exited = 0;
     data->running = 1;
-    pthread_create(&data->thread, NULL, thread_function, device);
+
+    mixer_threads_alive++;
+    if (pthread_create(&data->thread, NULL, thread_function, data) != 0)
+    {
+        data->thread_started = 0;
+        data->running = 0;
+        mixer_threads_alive--;
+        return ALC_FALSE;
+    }
 
     return ALC_TRUE;
 }
@@ -439,11 +630,58 @@ static ALCboolean android_reset_playback(ALCdevice *device)
 static void android_stop_playback(ALCdevice *device)
 {
     AndroidData* data = (AndroidData*)device->ExtraData;
+    int transfer = 0;
 
-    if (data->running)
+    if (data != NULL && data->running)
     {
+        struct timespec deadline;
+        int rc = 0;
+
         data->running = 0;
-        pthread_join(data->thread, NULL);
+
+        clock_gettime(CLOCK_MONOTONIC, &deadline);
+        deadline.tv_nsec += (long)AUDIOTRACK_JOIN_TIMEOUT_MS * 1000000L;
+        while (deadline.tv_nsec >= 1000000000L)
+        {
+            deadline.tv_sec += 1;
+            deadline.tv_nsec -= 1000000000L;
+        }
+
+        /* Never wait for the mixer thread without a bound: a thread wedged
+         * outside audiotrack_write (a stalled JNI call, a wedged sink) must not
+         * hold the UI thread in teardown (ADR 0001, ticket 04).
+         *
+         * bionic has no pthread_timedjoin_np (not in the NDK headers nor the
+         * device libc), so this is the equivalent bounded join: the thread
+         * signals `exited` on the way out and the stopper waits for it on a
+         * monotonic clock. */
+        pthread_mutex_lock(&data->lock);
+        while (!data->thread_exited)
+        {
+            rc = pthread_cond_timedwait(&data->exited, &data->lock, &deadline);
+            if (rc != 0)
+            {
+                break;
+            }
+        }
+        if (!data->thread_exited)
+        {
+            data->detached = 1;
+            transfer = 1;
+        }
+        pthread_mutex_unlock(&data->lock);
+
+        if (transfer)
+        {
+            /* Ownership of AndroidData, the AudioTrack jobject and the
+             * thread's JNI state moves to the mixer thread until it exits.
+             * android_close_playback() must not free it. */
+            device->ExtraData = NULL;
+#ifdef CLIENTE_OPENAL_STALL_PROBE
+            debug_detach_count++;
+#endif
+        }
+        pthread_detach(data->thread);
     }
     suspended = 0;
 }
@@ -529,9 +767,20 @@ void alc_audiotrack_init(BackendFuncs *func_list)
 
 void alc_audiotrack_deinit(void)
 {
+    /* A thread detached by a timed-out join still owns its AudioTrack and JNI
+     * state until it exits. Leave the process-lifetime class ref and the
+     * attached env alone rather than pull them from under it (ticket 04). */
+    if (mixer_threads_alive > 0)
+    {
+        return;
+    }
+
     /* release cached AudioTrack class */
     JavaVM *javaVM = alcGetJavaVM();
-    (*env)->DeleteGlobalRef(env, cAudioTrack);
+    if (env != NULL && cAudioTrack != NULL)
+    {
+        (*env)->DeleteGlobalRef(env, cAudioTrack);
+    }
     (*javaVM)->DetachCurrentThread(javaVM);
     cAudioTrack = NULL;
 }

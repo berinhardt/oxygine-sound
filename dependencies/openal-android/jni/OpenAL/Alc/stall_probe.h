@@ -31,6 +31,15 @@ void alc_android_test_set_outside_stall_ms(unsigned int ms);
  * stalled sink (whether the write blocked or reported a full sink). */
 int alc_android_test_stall_active(void);
 
+/* How many stop operations timed out and detached the mixer thread (the
+ * ownership-transfer path). */
+int alc_android_test_detach_count(void);
+
+/* How many mixer threads are still running or exiting. The probe waits for
+ * this to reach 0 after teardown so a detached thread completes its own
+ * cleanup before the process ends. */
+int alc_android_test_live_mixer_threads(void);
+
 #ifdef __cplusplus
 }
 #endif
