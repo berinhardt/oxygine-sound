@@ -410,6 +410,11 @@ struct ALCdevice_struct
     BackendFuncs *Funcs;
     void         *ExtraData; // For the backend's use
 
+    // Set by the backend when it detached a thread that can still use this
+    // device. alcCloseDevice() must then leak the device instead of freeing it;
+    // the process is shutting down anyway (ADR 0001, audiotrack backend).
+    ALboolean    PlaybackDetached;
+
     ALCdevice *next;
 };
 

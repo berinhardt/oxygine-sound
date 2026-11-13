@@ -175,8 +175,11 @@ typedef struct
     volatile int running;
 
     /* Snapshot of the ALCdevice fields the mixer thread needs. On a timed-out
-     * join the thread outlives alcDestroyContext()/alcCloseDevice(), so after
-     * the detach it must not dereference the ALCdevice at all (ADR 0001). */
+     * join the thread outlives alcDestroyContext()/alcCloseDevice(); the device
+     * pointer itself is only used for aluMixData(), and on that path ALc.c is
+     * told to leak the device instead of freeing it (PlaybackDetached). The
+     * fields below are read from this snapshot so pacing never dereferences a
+     * possibly-closed device (ADR 0001, ticket 04). */
     ALCdevice *device;
     unsigned int frequency;
     unsigned int frameSize;
@@ -191,7 +194,6 @@ typedef struct
      * android_close_playback() must not free it. */
     pthread_mutex_t lock;
     pthread_cond_t exited;
-    int thread_started;
     int detached;
     int thread_exited;
 } AndroidData;
@@ -353,6 +355,13 @@ static void* thread_function(void* arg)
     AndroidData* data = (AndroidData*)arg;
     ALCdevice* device = data->device;
     JavaVM *javaVM = alcGetJavaVM();
+
+    /* Detach on entry, so the stopper never owns the thread handle. After a
+     * timed-out join the stopper hands `data` to this thread and must not touch
+     * it again; a pthread_detach() there would race with this thread freeing
+     * the struct (ticket 04). */
+    pthread_detach(pthread_self());
+
     JNIEnv *threadEnv = NULL;
     jobject track;
     jarray buffer;
@@ -424,9 +433,10 @@ static void* thread_function(void* arg)
         {
             jint written;
 
-            /* The device is only valid while the joiner is still waiting. On a
-             * timed-out join the stopper has returned and may already have
-             * destroyed it, so re-test `running` before touching it. */
+            /* On a timed-out join the stopper has returned. Re-test `running`
+             * so a thread that has not yet entered the mix cannot start a new
+             * one after shutdown; the device memory itself is kept alive by
+             * PlaybackDetached (ADR 0001). */
             if (!data->running)
             {
                 (*threadEnv)->ReleasePrimitiveArrayCritical(threadEnv, buffer, pBuffer, 0);
@@ -541,12 +551,12 @@ static void android_close_playback(ALCdevice *device)
         return;
     }
 
-    /* Never free the struct while the mixer thread can still touch it. The
-     * timeout path clears ExtraData and hands ownership to the thread, so a
-     * non-NULL thread_started here that has not exited is a programming error;
-     * leak rather than risk a use-after-free (ADR 0001, ticket 04). */
+    /* Only a timed-out join transfers ownership to the mixer thread, which
+     * frees the struct itself on exit. The timeout path also clears ExtraData,
+     * so seeing `detached` here is a defensive check; every other close path
+     * has already waited for the thread to exit and may free the struct. */
     pthread_mutex_lock(&data->lock);
-    if (data->thread_started && !data->thread_exited)
+    if (data->detached)
     {
         can_free = 0;
     }
@@ -610,7 +620,6 @@ static ALCboolean android_reset_playback(ALCdevice *device)
         ? ENCODING_PCM_8BIT : ENCODING_PCM_16BIT;
     data->numUpdates = (int)numUpdates;
 
-    data->thread_started = 1;
     data->detached = 0;
     data->thread_exited = 0;
     data->running = 1;
@@ -618,7 +627,6 @@ static ALCboolean android_reset_playback(ALCdevice *device)
     mixer_threads_alive++;
     if (pthread_create(&data->thread, NULL, thread_function, data) != 0)
     {
-        data->thread_started = 0;
         data->running = 0;
         mixer_threads_alive--;
         return ALC_FALSE;
@@ -666,6 +674,17 @@ static void android_stop_playback(ALCdevice *device)
         }
         if (!data->thread_exited)
         {
+            /* Two things must happen before ownership leaves the stopper:
+             *
+             *  - Mark the device for deferred free. The thread may still be
+             *    inside aluMixData() and will keep using the device until it
+             *    observes `running == 0`; alcCloseDevice() must leak it rather
+             *    than free it (ADR 0001, ticket 04).
+             *  - Set `detached` while holding the lock. From the moment the
+             *    lock is released the thread may free `data`, so the stopper
+             *    must not touch `data` (or its thread handle) afterwards; the
+             *    thread detached itself on entry. */
+            device->PlaybackDetached = AL_TRUE;
             data->detached = 1;
             transfer = 1;
         }
@@ -681,7 +700,6 @@ static void android_stop_playback(ALCdevice *device)
             debug_detach_count++;
 #endif
         }
-        pthread_detach(data->thread);
     }
     suspended = 0;
 }
