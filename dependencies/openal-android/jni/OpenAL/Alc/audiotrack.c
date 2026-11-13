@@ -21,6 +21,7 @@
 #include "config.h"
 
 #include <stdlib.h>
+#include <unistd.h>
 #include <jni.h>
 #include <pthread.h>
 #include "alMain.h"
@@ -121,6 +122,7 @@ static jmethodID mPause;
 static jmethodID mStop;
 static jmethodID mRelease;
 static jmethodID mWrite;
+static jmethodID mWriteNonBlocking;
 
 static int suspended = 0;
 static int audioTrackPlaying = 0;
@@ -138,15 +140,24 @@ typedef struct
 #define ENCODING_PCM_8BIT 3
 #define ENCODING_PCM_16BIT 2
 #define MODE_STREAM 1
+/* android.media.AudioTrack.WRITE_NON_BLOCKING (API 23+). */
+#define WRITE_NON_BLOCKING 1
 
-/* All mixer writes go through here. The debug stall switch turns this call
- * into the shape of a sink that has stopped accepting data:
+/* All mixer writes go through here. With `nonBlocking` set this is the
+ * AudioTrack.write(byte[], int, int, WRITE_NON_BLOCKING) overload: it returns
+ * as soon as the track reports how much it accepted, so the mixer loop can
+ * always re-test `running` and observe shutdown (ticket 03, ADR 0001). A short
+ * write means the sink is full; the caller drops the remainder instead of
+ * waiting for the sink to drain.
+ *
+ * The debug stall switch turns this call into the shape of a sink that has
+ * stopped accepting data:
  *   - blocking write (nonBlocking == 0): park for the stall window, like
  *     AudioTrack.write() on a wedged audio server;
  *   - non-blocking write (nonBlocking != 0): report a full sink immediately so
  *     the loop can re-test `running` (ticket 03).
- * In a release build neither branch exists and this is exactly the old
- * CallNonvirtualIntMethod(mWrite) call. */
+ * In a release build neither stall branch exists; the non-blocking overload is
+ * used like any other write. */
 static jint audiotrack_write(AndroidData *data, jobject track, jarray buffer,
                              int bufferSizeInBytes, int nonBlocking)
 {
@@ -165,12 +176,51 @@ static jint audiotrack_write(AndroidData *data, jobject track, jarray buffer,
         /* The buffer is intentionally discarded: the sink was not draining. */
         return bufferSizeInBytes;
     }
-#else
-    (void)nonBlocking;
 #endif
+
+    if (nonBlocking)
+    {
+        return (*env)->CallNonvirtualIntMethod(env, track, cAudioTrack,
+                                               mWriteNonBlocking,
+                                               buffer, 0, bufferSizeInBytes,
+                                               WRITE_NON_BLOCKING);
+    }
 
     return (*env)->CallNonvirtualIntMethod(env, track, cAudioTrack, mWrite,
                                            buffer, 0, bufferSizeInBytes);
+}
+
+/* A non-blocking write cannot pace the mixer any more: when the sink is full
+ * the write returns immediately and the loop would spin, mixing buffers as
+ * fast as the CPU allows and dropping all of them. Sleep for the play time of
+ * the bytes that were not accepted so we keep producing audio at the sink's
+ * rate without ever waiting for the sink itself. The sleep is bounded by the
+ * buffer length (a few ms), so shutdown is still observed on the next loop
+ * iteration. */
+static void audiotrack_pace_dropped(const ALCdevice *device,
+                                    unsigned int unwrittenBytes)
+{
+    unsigned int bytesPerSecond =
+        (unsigned int)device->Frequency *
+        (unsigned int)FrameSizeFromDevFmt(device->FmtChans, device->FmtType);
+    unsigned int usec;
+
+    if (bytesPerSecond == 0 || unwrittenBytes == 0)
+    {
+        return;
+    }
+
+    usec = (unsigned int)((unsigned long long)unwrittenBytes * 1000000ull /
+                          bytesPerSecond);
+    if (usec == 0)
+    {
+        usec = 1;
+    }
+    if (usec > 1000000u)
+    {
+        usec = 1000000u;
+    }
+    usleep(usec);
 }
 
 static void* thread_function(void* arg)
@@ -234,10 +284,24 @@ static void* thread_function(void* arg)
 
         if (pBuffer)
         {
+            jint written;
+
             aluMixData(device, pBuffer, bufferSizeInSamples);
             (*env)->ReleasePrimitiveArrayCritical(env, buffer, pBuffer, 0);
 
-            audiotrack_write(data, track, buffer, bufferSizeInBytes, 0);
+            /* Never block on the sink: if it cannot take the whole chunk, the
+             * remainder is dropped and the thread re-tests `running` after at
+             * most one buffer of pacing. */
+            written = audiotrack_write(data, track, buffer, bufferSizeInBytes, 1);
+            if (written < 0)
+            {
+                written = 0;
+            }
+            if ((int)written < bufferSizeInBytes)
+            {
+                audiotrack_pace_dropped(device,
+                                        (unsigned int)(bufferSizeInBytes - (int)written));
+            }
         }
         else
         {
@@ -285,6 +349,7 @@ static ALCboolean android_open_playback(ALCdevice *device, const ALCchar *device
         mStop = (*env)->GetMethodID(env, cAudioTrack, "stop", "()V");
         mRelease = (*env)->GetMethodID(env, cAudioTrack, "release", "()V");
         mWrite = (*env)->GetMethodID(env, cAudioTrack, "write", "([BII)I");
+        mWriteNonBlocking = (*env)->GetMethodID(env, cAudioTrack, "write", "([BIII)I");
     }
 
     if (!deviceName)
