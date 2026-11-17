@@ -1,11 +1,10 @@
 LOCAL_PATH := $(call my-dir)
 
-include $(CLEAR_VARS)
-LOCAL_MODULE := openal
-LOCAL_SRC_FILES := dependencies/openal-android/obj/local/$(TARGET_ARCH_ABI)/libopenal.a
-include $(PREBUILT_STATIC_LIBRARY) 
-
-
+# OpenAL is compiled from the vendored source in dependencies/openal-android
+# (module defined at the end of this file). It used to be a checked-in
+# prebuilt binary, which silently ignored source edits; see
+# docs/adr/0001-bounded-sound-teardown.md.
+OPENAL_ANDROID_MAKEFILE := $(LOCAL_PATH)/dependencies/openal-android/jni/Android.mk
 
 include $(CLEAR_VARS)
 
@@ -56,3 +55,7 @@ include $(BUILD_STATIC_LIBRARY)
 $(call import-module, SDL)
 $(call import-module, oxygine-sound/dependencies/libogg)
 $(call import-module, oxygine-sound/dependencies/tremor)
+
+# Build `openal` from the vendored source. Keep this last: the included
+# makefile sets its own LOCAL_PATH and module state.
+include $(OPENAL_ANDROID_MAKEFILE)

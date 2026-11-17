@@ -2285,6 +2285,21 @@ ALC_API ALCboolean ALC_APIENTRY alcCloseDevice(ALCdevice *pDevice)
     }
     ALCdevice_ClosePlayback(pDevice);
 
+    if(pDevice->PlaybackDetached)
+    {
+        /* The playback backend timed out waiting for its mixer thread and
+         * detached it. That thread may still be inside aluMixData() and will
+         * keep reading this device until it observes shutdown, so the memory
+         * must outlive it. The contexts and sources themselves are safe: they
+         * are only walked under g_csMutex, and alcDestroyContext removes and
+         * releases them while holding that lock, before this point. Only the
+         * device struct (and the Contexts array it points at) has to be kept
+         * alive. Leak it until process exit; this is the documented cost of
+         * the bounded join in ADR 0001. Do not memset or free anything below. */
+        AL_PRINT("alcCloseDevice(): leaking device with a detached mixer thread\n");
+        return ALC_TRUE;
+    }
+
     if(pDevice->BufferMap.size > 0)
     {
 #ifdef _DEBUG
