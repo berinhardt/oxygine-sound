@@ -40,6 +40,13 @@ int alc_android_test_detach_count(void);
  * cleanup before the process ends. */
 int alc_android_test_live_mixer_threads(void);
 
+/* Bytes handed to aluMixData() and bytes the AudioTrack sink accepted since
+ * playback started. Normal playback must accept everything it mixes, up to
+ * the one chunk still pending; if it accepts less, the backend is discarding
+ * audio and every sound plays fast. */
+unsigned long long alc_android_test_mixed_bytes(void);
+unsigned long long alc_android_test_accepted_bytes(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -147,6 +147,23 @@ int alc_android_test_live_mixer_threads(void)
 {
     return mixer_threads_alive;
 }
+
+/* Audio-parity test seam: bytes of mixed audio and bytes accepted by the
+ * sink. Normal playback must accept everything it mixes (up to one pending
+ * chunk), otherwise the source timeline advances faster than real time and
+ * sounds play fast. See test/android/teardown_stall_check.sh. */
+static volatile unsigned long long debug_mixed_bytes = 0;
+static volatile unsigned long long debug_accepted_bytes = 0;
+
+unsigned long long alc_android_test_mixed_bytes(void)
+{
+    return debug_mixed_bytes;
+}
+
+unsigned long long alc_android_test_accepted_bytes(void)
+{
+    return debug_accepted_bytes;
+}
 #endif
 
 static const ALCchar android_device[] = "Android Default";
@@ -252,8 +269,13 @@ static void android_data_free(AndroidData *data)
  * AudioTrack.write(byte[], int, int, WRITE_NON_BLOCKING) overload: it returns
  * as soon as the track reports how much it accepted, so the mixer loop can
  * always re-test `running` and observe shutdown (ticket 03, ADR 0001). A short
- * write means the sink is full; the caller drops the remainder instead of
- * waiting for the sink to drain.
+ * write means the sink is full; the caller keeps the remainder and retries it
+ * on the next iteration instead of mixing new audio, so no audio is lost.
+ *
+ * `offsetBytes` is the start of the still-unwritten part of `buffer`;
+ * `sizeInBytes` is how much of it is left. On a retry these point into the
+ * same mixed chunk, which is why the loop must not call aluMixData() until
+ * the whole chunk has reached the sink.
  *
  * The debug stall switch turns this call into the shape of a sink that has
  * stopped accepting data:
@@ -264,7 +286,7 @@ static void android_data_free(AndroidData *data)
  * In a release build neither stall branch exists; the non-blocking overload is
  * used like any other write. */
 static jint audiotrack_write(JNIEnv *jniEnv, AndroidData *data, jobject track,
-                             jarray buffer, int bufferSizeInBytes,
+                             jarray buffer, int offsetBytes, int sizeInBytes,
                              int nonBlocking)
 {
     (void)data;
@@ -279,8 +301,8 @@ static jint audiotrack_write(JNIEnv *jniEnv, AndroidData *data, jobject track,
 
         usleep(debug_stall_ms * 1000u);
 
-        /* The buffer is intentionally discarded: the sink was not draining. */
-        return bufferSizeInBytes;
+        /* The sink was not draining; report the whole slice as accepted. */
+        return sizeInBytes;
     }
 #endif
 
@@ -288,35 +310,37 @@ static jint audiotrack_write(JNIEnv *jniEnv, AndroidData *data, jobject track,
     {
         return (*jniEnv)->CallNonvirtualIntMethod(jniEnv, track, cAudioTrack,
                                                   mWriteNonBlocking,
-                                                  buffer, 0, bufferSizeInBytes,
+                                                  buffer, offsetBytes, sizeInBytes,
                                                   WRITE_NON_BLOCKING);
     }
 
     return (*jniEnv)->CallNonvirtualIntMethod(jniEnv, track, cAudioTrack, mWrite,
-                                              buffer, 0, bufferSizeInBytes);
+                                              buffer, offsetBytes, sizeInBytes);
 }
 
-/* A non-blocking write cannot pace the mixer any more: when the sink is full
- * the write returns immediately and the loop would spin, mixing buffers as
- * fast as the CPU allows and dropping all of them. Sleep for the play time of
- * the bytes that were not accepted so we keep producing audio at the sink's
- * rate without ever waiting for the sink itself.
+/* A non-blocking write cannot block the mixer thread, so when the sink is full
+ * the write returns immediately and the loop would spin. Sleep for the play
+ * time of the bytes still pending so the mixer slows down to the sink's rate
+ * without waiting for the sink itself. The pending bytes are retried, not
+ * discarded: the source timeline must not advance faster than the sink
+ * consumes it, or every sound plays fast (dropped chunks shorten the audible
+ * content while the AudioTrack timeline keeps real time).
  *
  * The sleep is capped at AUDIOTRACK_PACE_MAX_USEC, which also bounds how long
  * the mixer can go without observing `running`; it must stay below the join
  * budget (ticket 04). The ALCdevice fields are read from the AndroidData
  * snapshot because this can run after a timed-out join freed the device. */
-static void audiotrack_pace_dropped(const AndroidData *data,
-                                    unsigned int unwrittenBytes)
+static void audiotrack_pace_pending(const AndroidData *data,
+                                    unsigned int pendingBytes)
 {
     unsigned int usec;
 
-    if (data->bytesPerSecond == 0 || unwrittenBytes == 0)
+    if (data->bytesPerSecond == 0 || pendingBytes == 0)
     {
         return;
     }
 
-    usec = (unsigned int)((unsigned long long)unwrittenBytes * 1000000ull /
+    usec = (unsigned int)((unsigned long long)pendingBytes * 1000000ull /
                           data->bytesPerSecond);
     if (usec == 0)
     {
@@ -413,6 +437,9 @@ static void* thread_function(void* arg)
 
     buffer = (*threadEnv)->NewByteArray(threadEnv, bufferSizeInBytes);
 
+    jint pendingOffset = 0;
+    int haveChunk = 0;
+
     while (data->running)
     {
         if (suspended) {
@@ -427,55 +454,86 @@ static void* thread_function(void* arg)
             audioTrackPlaying = 1;
         }
 
-        void* pBuffer = (*threadEnv)->GetPrimitiveArrayCritical(threadEnv, buffer, NULL);
-
-        if (pBuffer)
+        /* Mix a new chunk only when the previous one has been fully handed to
+         * the sink. If a non-blocking write accepted only part of it, the
+         * remainder is retried below; it must not be replaced with newer
+         * audio, or the source timeline would run ahead of the sink and every
+         * sound would play fast. */
+        if (!haveChunk)
         {
-            jint written;
+            void* pBuffer = (*threadEnv)->GetPrimitiveArrayCritical(threadEnv, buffer, NULL);
 
-            /* On a timed-out join the stopper has returned. Re-test `running`
-             * so a thread that has not yet entered the mix cannot start a new
-             * one after shutdown; the device memory itself is kept alive by
-             * PlaybackDetached (ADR 0001). */
-            if (!data->running)
+            if (pBuffer)
             {
-                (*threadEnv)->ReleasePrimitiveArrayCritical(threadEnv, buffer, pBuffer, 0);
-                break;
-            }
+                /* On a timed-out join the stopper has returned. Re-test
+                 * `running` so a thread that has not yet entered the mix
+                 * cannot start a new one after shutdown; the device memory
+                 * itself is kept alive by PlaybackDetached (ADR 0001). */
+                if (!data->running)
+                {
+                    (*threadEnv)->ReleasePrimitiveArrayCritical(threadEnv, buffer, pBuffer, 0);
+                    break;
+                }
 
-            aluMixData(device, pBuffer, bufferSizeInSamples);
-            (*threadEnv)->ReleasePrimitiveArrayCritical(threadEnv, buffer, pBuffer, 0);
+                aluMixData(device, pBuffer, bufferSizeInSamples);
+                (*threadEnv)->ReleasePrimitiveArrayCritical(threadEnv, buffer, pBuffer, 0);
 
 #ifdef CLIENTE_OPENAL_STALL_PROBE
-            /* Ticket 04 stall shape: block outside audiotrack_write. The
-             * thread is wedged before the JNI call, so the bounded join must
-             * time out, detach, and leave the track/JNI state to this thread
-             * until it wakes and exits. */
-            if (debug_stall_outside_ms > 0)
-            {
-                debug_stall_active = 1;
-                usleep(debug_stall_outside_ms * 1000u);
-            }
+                debug_mixed_bytes += (unsigned long long)bufferSizeInBytes;
+
+                /* Ticket 04 stall shape: block outside audiotrack_write. The
+                 * thread is wedged before the JNI call, so the bounded join
+                 * must time out, detach, and leave the track/JNI state to
+                 * this thread until it wakes and exits. */
+                if (debug_stall_outside_ms > 0)
+                {
+                    debug_stall_active = 1;
+                    usleep(debug_stall_outside_ms * 1000u);
+                }
 #endif
 
-            /* Never block on the sink: if it cannot take the whole chunk, the
-             * remainder is dropped and the thread re-tests `running` after at
-             * most one buffer of pacing. */
-            written = audiotrack_write(threadEnv, data, track, buffer,
-                                       bufferSizeInBytes, 1);
+                pendingOffset = 0;
+                haveChunk = 1;
+            }
+            else
+            {
+                AL_PRINT("Failed to get pointer to array bytes");
+                usleep(1000);
+                continue;
+            }
+        }
+
+        {
+            jint remaining = bufferSizeInBytes - pendingOffset;
+            jint written = audiotrack_write(threadEnv, data, track, buffer,
+                                            pendingOffset, remaining, 1);
             if (written < 0)
             {
                 written = 0;
             }
-            if ((int)written < bufferSizeInBytes)
+            if (written > remaining)
             {
-                audiotrack_pace_dropped(data,
-                                        (unsigned int)(bufferSizeInBytes - (int)written));
+                written = remaining;
             }
-        }
-        else
-        {
-            AL_PRINT("Failed to get pointer to array bytes");
+
+#ifdef CLIENTE_OPENAL_STALL_PROBE
+            debug_accepted_bytes += (unsigned long long)written;
+#endif
+
+            pendingOffset += written;
+            if (pendingOffset >= bufferSizeInBytes)
+            {
+                pendingOffset = 0;
+                haveChunk = 0;
+            }
+            else
+            {
+                /* The sink is full: sleep for the pending play time, then
+                 * retry the same bytes. Capped so `running` is observed
+                 * within the teardown budget. */
+                audiotrack_pace_pending(data,
+                                        (unsigned int)(bufferSizeInBytes - pendingOffset));
+            }
         }
     }
 
@@ -592,6 +650,8 @@ static ALCboolean android_reset_playback(ALCdevice *device)
 #ifdef CLIENTE_OPENAL_STALL_PROBE
     debug_stall_refresh_from_property();
     debug_stall_active = 0;
+    debug_mixed_bytes = 0;
+    debug_accepted_bytes = 0;
 #endif
 
     /* A timed-out stop handed the old struct to its detached thread and cleared
