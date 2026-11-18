@@ -47,6 +47,29 @@ int alc_android_test_live_mixer_threads(void);
 unsigned long long alc_android_test_mixed_bytes(void);
 unsigned long long alc_android_test_accepted_bytes(void);
 
+/* OpenSL ES backend seams (ADR 0003). The OpenSL mixer is stopped and joined
+ * on every background transition, so the bounded join has its own probe
+ * scenario. */
+
+/* Park the mixer thread for `ms` milliseconds while it holds a buffer mutex.
+ * That is the shape of a mixer blocked behind the OpenSL callback's
+ * synchronous Enqueue against a stalled audio server. 0 disables it. */
+void alc_android_test_set_opensles_stall_ms(unsigned int ms);
+
+/* Non-zero while the OpenSL mixer is inside the simulated stall. */
+int alc_android_test_opensles_stall_active(void);
+
+/* How many OpenSL stops timed out and detached the mixer thread. */
+int alc_android_test_opensles_detach_count(void);
+
+/* How many OpenSL mixer threads are still running or exiting. */
+int alc_android_test_opensles_live_mixer_threads(void);
+
+/* Bytes of audio handed to aluMixData() by the OpenSL mixer since the process
+ * started. A resumed mixer must keep increasing it; a deferred restart (see
+ * ADR 0003) intentionally does not. */
+unsigned long long alc_android_test_opensles_mixed_bytes(void);
+
 #ifdef __cplusplus
 }
 #endif

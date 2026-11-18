@@ -52,6 +52,123 @@
 
 #include "apportable_openal_funcs.h"
 
+/* How long teardown waits for the mixer thread before detaching it and letting
+ * teardown continue (ADR 0003, same budget as ADR 0001's AudioTrack path). */
+#define OPENSLES_JOIN_TIMEOUT_MS 200
+
+/* Number of mixer threads that have been started and not yet returned. Used to
+ * keep the process-lifetime OpenSL objects alive while a thread detached by a
+ * timed-out join can still touch them (ADR 0003). */
+static volatile int mixer_threads_alive = 0;
+
+#ifdef CLIENTE_OPENAL_STALL_PROBE
+#include <sys/system_properties.h>
+#include "stall_probe.h"
+
+/* Debug-only mixer stall (ADR 0003).
+ *
+ * The real wedge is a mixer blocked on a buffer mutex held by the OpenSL
+ * callback while its synchronous Enqueue talks to a stalled audio server,
+ * which we cannot invoke from outside the app. This switch parks the mixer
+ * thread for `ms` while it holds a buffer mutex, producing the same shape: the
+ * thread cannot observe threadShouldRun, so an unbounded stop would wait for
+ * it. Enable it at runtime with:
+ *
+ *     adb shell setprop debug.openal.opensles_stall_ms 8000
+ *
+ * and clear it with `setprop ... 0`.
+ */
+#define OPENSLES_STALL_PROPERTY "debug.openal.opensles_stall_ms"
+#define OPENSLES_STALL_MAX_MS 600000u
+
+static volatile unsigned int debug_opensles_stall_ms = 0;
+static volatile int debug_opensles_stall_override = 0;
+static volatile int debug_opensles_stall_active = 0;
+static volatile int debug_opensles_detach_count = 0;
+static volatile unsigned long long debug_opensles_mixed_bytes = 0;
+
+static unsigned int debug_opensles_parse_ms(const char *value)
+{
+    char *end = NULL;
+    unsigned long ms;
+
+    if (value == NULL || value[0] == '\0')
+    {
+        return 0;
+    }
+    ms = strtoul(value, &end, 10);
+    if (end == value || ms > OPENSLES_STALL_MAX_MS)
+    {
+        return 0;
+    }
+    return (unsigned int)ms;
+}
+
+static void debug_opensles_stall_refresh_from_property(void)
+{
+    char value[PROP_VALUE_MAX];
+
+    if (debug_opensles_stall_override)
+    {
+        return;
+    }
+    value[0] = '\0';
+    if (__system_property_get(OPENSLES_STALL_PROPERTY, value) > 0)
+    {
+        debug_opensles_stall_ms = debug_opensles_parse_ms(value);
+    }
+}
+
+void alc_android_test_set_opensles_stall_ms(unsigned int ms)
+{
+    debug_opensles_stall_ms = (ms <= OPENSLES_STALL_MAX_MS) ? ms : 0;
+    debug_opensles_stall_override = 1;
+}
+
+int alc_android_test_opensles_stall_active(void)
+{
+    return debug_opensles_stall_active;
+}
+
+int alc_android_test_opensles_detach_count(void)
+{
+    return debug_opensles_detach_count;
+}
+
+int alc_android_test_opensles_live_mixer_threads(void)
+{
+    return mixer_threads_alive;
+}
+
+unsigned long long alc_android_test_opensles_mixed_bytes(void)
+{
+    return debug_opensles_mixed_bytes;
+}
+
+/* Called from the mixer thread with a buffer mutex held. */
+static void debug_opensles_stall_in_mixer(void)
+{
+    unsigned int ms;
+
+    if (!debug_opensles_stall_override)
+    {
+        debug_opensles_stall_refresh_from_property();
+    }
+    ms = debug_opensles_stall_ms;
+    if (ms == 0)
+    {
+        return;
+    }
+    debug_opensles_stall_active = 1;
+    usleep((useconds_t)ms * 1000u);
+    debug_opensles_stall_active = 0;
+}
+#else
+static void debug_opensles_stall_in_mixer(void)
+{
+}
+#endif
+
 /*
 #define MAKE_SYM_POINTER(sym) static typeof(sym) * p##sym = NULL
 MAKE_SYM_POINTER(SL_IID_ENGINE);
@@ -166,6 +283,17 @@ typedef struct {
     char lastBufferEnqueued;
     char lastBufferMixed;
 
+    /* Ownership handshake (ADR 0003). The mixer thread detaches itself on
+     * entry, so the stopper never owns the thread handle. A stop waits for
+     * `thread_exited` with a bound; on timeout it marks `detached` and the
+     * device PlaybackDetached, and from then on the thread owns the playback
+     * state until it exits. `detached` also forbids starting a second mixer
+     * while the old one can still run. */
+    pthread_mutex_t exit_mutex;
+    pthread_cond_t  exit_cond;
+    int detached;
+    int thread_exited;
+
     outputBuffer_t *outputBuffers;
 
     // buffer queue player interfaces
@@ -218,6 +346,17 @@ static void devlist_process(deviceListFn mapFunction) {
 }
 
 
+static void mixer_thread_exit(opesles_data_t *devState)
+{
+    pthread_mutex_lock(&devState->exit_mutex);
+    devState->thread_exited = 1;
+    pthread_cond_signal(&devState->exit_cond);
+    pthread_mutex_unlock(&devState->exit_mutex);
+
+    mixer_threads_alive--;
+    pthread_exit(0);
+}
+
 static void *playback_function(void * context) {
     LOGV("playback_function started");
     outputBuffer_t *buffer = NULL;
@@ -233,9 +372,14 @@ static void *playback_function(void * context) {
     // Show a sensible name for the thread in debug tools
     prctl(PR_SET_NAME, (unsigned long)"OpenAL/sl/m", 0, 0, 0);
 
+    /* Detach on entry so the stopper never owns the thread handle. A stop that
+     * times out must be able to walk away from this thread; a pthread_join()
+     * there would race with the thread exiting (ADR 0003). */
+    pthread_detach(pthread_self());
+
     while (1) {
         if (devState->threadShouldRun == 0) {
-            pthread_exit(0);
+            mixer_thread_exit(devState);
         }
 
         bufferIndex = (++bufferIndex) % bufferCount;
@@ -247,7 +391,7 @@ static void *playback_function(void * context) {
         while (1) {
             if (devState->threadShouldRun == 0) {
                 pthread_mutex_unlock(&(buffer->mutex));
-                pthread_exit(0);
+                mixer_thread_exit(devState);
             }
 
             // This is a little hacky, but here we avoid mixing too much data
@@ -268,7 +412,12 @@ static void *playback_function(void * context) {
         }
         devState->threadIsReady = 1;
 
+        debug_opensles_stall_in_mixer();
+
         aluMixData(pDevice, buffer->buffer, bufferSize/frameSize);
+#ifdef CLIENTE_OPENAL_STALL_PROBE
+        debug_opensles_mixed_bytes += bufferSize;
+#endif
         buffer->state = OUTPUT_BUFFER_STATE_MIXED;
         pthread_cond_signal(&(buffer->cond));
         pthread_mutex_unlock(&(buffer->mutex));
@@ -295,6 +444,19 @@ SLresult alc_opensles_init_extradata(ALCdevice *pDevice)
     bzero(devState->outputBuffers, sizeof(outputBuffer_t)*bufferCount);
     devState->lastBufferEnqueued = -1;
     devState->lastBufferMixed = -1;
+
+    /* Bounded-stop handshake (ADR 0003). The condition variable uses the
+     * monotonic clock so a wall-clock change cannot stretch or collapse the
+     * join budget. */
+    {
+        pthread_condattr_t exitAttr;
+        pthread_mutex_init(&(devState->exit_mutex), (pthread_mutexattr_t*) NULL);
+        pthread_condattr_init(&exitAttr);
+        pthread_condattr_setclock(&exitAttr, CLOCK_MONOTONIC);
+        pthread_cond_init(&(devState->exit_cond), &exitAttr);
+        pthread_condattr_destroy(&exitAttr);
+    }
+
     for (i = 0; i < bufferCount; i++) {
         if (pthread_mutex_init(&(devState->outputBuffers[i].mutex), (pthread_mutexattr_t*) NULL) != 0) {
             LOGV("Error on init of mutex");
@@ -333,28 +495,108 @@ static void start_playback(ALCdevice *pDevice) {
         return;
     }
 
-    // start/restart playback thread
+    /* A stop that timed out handed the playback state to the detached mixer
+     * thread. Do not revive it and do not start a second mixer: two threads
+     * would mix into the same output buffers. `threadShouldRun` stays 0 so the
+     * old thread exits as soon as it can; audio resumes on the next
+     * start_playback() after it has really exited (ADR 0003). */
+    pthread_mutex_lock(&(devState->exit_mutex));
+    if (devState->detached && !devState->thread_exited) {
+        pthread_mutex_unlock(&(devState->exit_mutex));
+        LOGV("start_playback: previous mixer thread is still detached; deferring restart");
+        return;
+    }
+    devState->detached = 0;
+    devState->thread_exited = 0;
     devState->threadShouldRun = 1;
+    /* The device was only marked for deferred free because of the old, now
+     * gone mixer thread. */
+    pDevice->PlaybackDetached = AL_FALSE;
+    pthread_mutex_unlock(&(devState->exit_mutex));
+    devState->threadIsReady = 0;
 
+    // start/restart playback thread
     pthread_attr_t playbackThreadAttr;
     pthread_attr_init(&playbackThreadAttr);
     //struct sched_param playbackThreadParam;
     //playbackThreadParam.sched_priority = sched_get_priority_max(SCHED_RR);
     //pthread_attr_setschedpolicy(&playbackThreadAttr, SCHED_RR);
     //pthread_attr_setschedparam(&playbackThreadAttr, &playbackThreadParam);
-    pthread_create(&(devState->playbackThread), &playbackThreadAttr, playback_function,  (void *) pDevice);
+    mixer_threads_alive++;
+    if (pthread_create(&(devState->playbackThread), &playbackThreadAttr, playback_function,  (void *) pDevice) != 0) {
+        devState->threadShouldRun = 0;
+        mixer_threads_alive--;
+        return;
+    }
 
-    while (devState->threadShouldRun && (0 == devState->threadIsReady))
+    /* Wait for the new mixer to produce its first buffer, but never without a
+     * bound: if the sink is stalled no buffer becomes free and the mixer stays
+     * in its buffer wait, and spinning here would hang the pause/resume thread
+     * instead (ADR 0003). */
     {
-        sched_yield();
+        struct timespec startDeadline;
+        clock_gettime(CLOCK_MONOTONIC, &startDeadline);
+        startDeadline.tv_nsec += (long)OPENSLES_JOIN_TIMEOUT_MS * 1000000L;
+        while (startDeadline.tv_nsec >= 1000000000L)
+        {
+            startDeadline.tv_sec += 1;
+            startDeadline.tv_nsec -= 1000000000L;
+        }
+        while (devState->threadShouldRun && (0 == devState->threadIsReady))
+        {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            if (now.tv_sec > startDeadline.tv_sec ||
+                (now.tv_sec == startDeadline.tv_sec && now.tv_nsec >= startDeadline.tv_nsec))
+            {
+                break;
+            }
+            sched_yield();
+        }
     }
 }
 
 static void stop_playback(ALCdevice *pDevice) {
     opesles_data_t *devState = (opesles_data_t *) pDevice->ExtraData;
     if (devState->threadShouldRun == 1) {
+      struct timespec deadline;
+
       devState->threadShouldRun = 0;
-      pthread_join(devState->playbackThread, NULL);
+
+      clock_gettime(CLOCK_MONOTONIC, &deadline);
+      deadline.tv_nsec += (long)OPENSLES_JOIN_TIMEOUT_MS * 1000000L;
+      while (deadline.tv_nsec >= 1000000000L)
+      {
+          deadline.tv_sec += 1;
+          deadline.tv_nsec -= 1000000000L;
+      }
+
+      /* Never wait for the mixer thread without a bound: it can be blocked on
+       * a buffer mutex held by the OpenSL callback, and that callback can be
+       * stuck in a synchronous Enqueue against a stalled audio server. The UI
+       * thread must not wait for that (ADR 0003). */
+      pthread_mutex_lock(&(devState->exit_mutex));
+      while (!devState->thread_exited)
+      {
+          if (pthread_cond_timedwait(&(devState->exit_cond), &(devState->exit_mutex), &deadline) != 0)
+          {
+              break;
+          }
+      }
+      if (!devState->thread_exited)
+      {
+          /* The thread may still be inside aluMixData() or blocked on a buffer
+           * mutex and will keep using devState and the device until it exits.
+           * Mark the device so alcCloseDevice() leaks it instead of freeing it,
+           * and forbid a restart until the thread has really exited. */
+          devState->detached = 1;
+          pDevice->PlaybackDetached = AL_TRUE;
+#ifdef CLIENTE_OPENAL_STALL_PROBE
+          debug_opensles_detach_count++;
+#endif
+          LOGV("stop_playback: mixer thread detached after %d ms", OPENSLES_JOIN_TIMEOUT_MS);
+      }
+      pthread_mutex_unlock(&(devState->exit_mutex));
     }
     return;
 }
@@ -477,6 +719,33 @@ static void opensles_close_playback(ALCdevice *pDevice)
 {
     LOGV("opensles_close_playback pDevice=%p", pDevice);
     opesles_data_t *devState = (opesles_data_t *) pDevice->ExtraData;
+
+    if (devState == NULL) {
+        return;
+    }
+
+    if (devState->detached) {
+        int exited;
+
+        pthread_mutex_lock(&(devState->exit_mutex));
+        exited = devState->thread_exited;
+        pthread_mutex_unlock(&(devState->exit_mutex));
+
+        if (!exited) {
+            /* The mixer thread outlived the bounded stop and may still be
+             * inside aluMixData() or blocked on a buffer mutex held by the
+             * OpenSL callback. Destroying the player would race with that
+             * callback, so leak the player here; alcCloseDevice() honours
+             * PlaybackDetached and leaks the device too (ADR 0003). */
+            LOGV("opensles_close_playback: mixer thread still detached; leaking player and device");
+            devlist_remove(pDevice);
+            return;
+        }
+
+        /* The thread exited after the stop timed out, so the player and the
+         * device can be torn down normally again. */
+        pDevice->PlaybackDetached = AL_FALSE;
+    }
 
     // shut down the native audio system
 
@@ -745,6 +1014,15 @@ void alc_opensles_init(BackendFuncs *func_list)
 void alc_opensles_deinit(void)
 {
     LOGV("alc_opensles_deinit");
+
+    /* A thread detached by a timed-out join still owns the device and can be
+     * inside aluMixData(); tearing the engine down under it would be a
+     * use-after-free. Leave the process-lifetime OpenSL objects alone until
+     * process exit (ADR 0003). */
+    if (mixer_threads_alive > 0) {
+        LOGV("alc_opensles_deinit: %d mixer thread(s) still alive; leaving OpenSL objects", mixer_threads_alive);
+        return;
+    }
 
     // destroy output mix object, and invalidate all associated interfaces
     if (outputMixObject != NULL) {
