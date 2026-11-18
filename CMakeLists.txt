@@ -1,15 +1,12 @@
 cmake_minimum_required (VERSION 3.16)
 
-# Android keeps clang's default C++ dialect: the ndk-build baseline compiled
-# this module at that default, and a byte comparison of the two builds needs
-# the same codegen. The Emscripten and native graphs keep the C++11 pin.
+# Android keeps clang's default C++ dialect; the Emscripten and native graphs
+# pin C++11.
 if (NOT ANDROID)
    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11")
 endif()
 
-# Android.mk hands the compiler its sources in the order LOCAL_SRC_FILES lists
-# them, the archiver keeps that member order, and the final link layout follows
-# it, so the sequence below is Android.mk's rather than a folder-by-folder one.
+# Source order is not load-bearing; the list is kept as it is.
 set(SRC
 	src/sound/MemoryStream.cpp
 	src/sound/MemoryStream.h
@@ -59,13 +56,11 @@ add_subdirectory(dependencies/tremor tremor)
 
 add_library(oxygine-sound STATIC ${SRC})
 if (ANDROID)
-	# Android.mk's LOCAL_CFLAGS and LOCAL_EXPORT_CFLAGS: the define is on this
-	# module's own TUs and on every consumer's (main's compile line had it).
+	# The define is on this module's own TUs and on every consumer's (the `main`
+	# target's compile line has it).
 	target_compile_definitions(oxygine-sound PRIVATE OXYGINE_SOUND=1)
 	target_compile_definitions(oxygine-sound INTERFACE OXYGINE_SOUND=1)
-	# Android.mk compiles src/sound/SoundHandle.cpp too (17 objects). The file
-	# is an empty namespace, so it adds no symbol, but the archive member list
-	# is part of the parity gate.
+	# src/sound/SoundHandle.cpp is an empty namespace: it adds no symbol.
 	target_sources(oxygine-sound PRIVATE src/sound/SoundHandle.cpp)
 endif()
 if(EMSCRIPTEN)
@@ -84,10 +79,9 @@ if(EMSCRIPTEN)
 
 elseif(ANDROID)
 	# Android has neither library available as a plain name. OpenAL is a
-	# per-ABI prebuilt static archive -- the exact one Android.mk links -- and it
-	# is not in the tree for every ABI, so a missing archive has to fail here
-	# rather than at link time. Ogg is built from source here, from the same two
-	# files Android.mk compiles; tremor is built above on every platform.
+	# per-ABI prebuilt static archive, and it is not in the tree for every ABI,
+	# so a missing archive has to fail here rather than at link time. Ogg is
+	# built from source here; tremor is built above on every platform.
 	add_subdirectory(dependencies/libogg libogg)
 
 	set(ANDROID_OPENAL_LIB
@@ -105,37 +99,23 @@ elseif(ANDROID)
 		dependencies/openal-android/jni/OpenAL/include
 		dependencies/libogg/include)
 
-	# Android.mk reached the framework headers through
-	# '$(LOCAL_PATH)/../oxygine-framework/oxygine/src/', listed in
-	# LOCAL_C_INCLUDES. ndk-build therefore recorded that spelling in __FILE__
-	# for the framework headers this module includes, relative to the module's
-	# own directory (e.g.
-	# '../../deps/oxygine-sound/../oxygine-framework/oxygine/src/oxygine/...').
-	# The inherited include directory is the collapsed absolute one, which the
-	# root prefix map rewrites to '../../deps/oxygine-framework/oxygine/src/...'.
-	# The literal lives in this module's own translation units, so a PRIVATE
-	# directory is enough; BEFORE puts it ahead of the inherited collapsed
-	# directory, so clang opens the header through the spelling ndk-build used.
-	# The include directory alone is sufficient: no matching prefix map is
-	# needed.
+	# This module's own translation units reach the framework headers through
+	# this `..` spelling, so a PRIVATE directory is enough; BEFORE puts it ahead
+	# of the inherited collapsed directory. Changing the spelling changes the
+	# path clang records for the header (`__FILE__` and debug info), not the
+	# code.
 	target_include_directories(oxygine-sound BEFORE PRIVATE
 		"${CMAKE_CURRENT_SOURCE_DIR}/../oxygine-framework/oxygine/src")
 	target_include_directories(oxygine-sound BEFORE PRIVATE
 		"${CMAKE_CURRENT_SOURCE_DIR}/../glm/")
 
-	# Android.mk put openal, libogg and tremor in the main module's
-	# LOCAL_WHOLE_STATIC_LIBRARIES, and ndk-build emits that whole-archive
-	# block ahead of the ordinary static libraries (build/core/
-	# default-build-commands.mk: objects, link-whole-archives, static libs,
-	# shared libs). A whole-archive pair declared here can only ever be
-	# emitted at this module's position in the link, after the selective
-	# archives, so it lays the blocks out in an order ndk-build never
-	# produced. The ordering decision belongs to the module that owns the
-	# link line: the main module names all three archives in its own ordered
-	# whole-archive group (which is still required -- OpenAL registers its
-	# ring-buffer helpers, CreateRingBuffer, DestroyRingBuffer,
-	# RingBufferSize, WriteRingBuffer and ReadRingBuffer, through internal
-	# function pointers, so a plain link drops them). Only the platform
+	# openal, libogg and tremor are linked whole by the main module's ordered
+	# whole-archive group (cmake/android.cmake), not here: a pair declared in
+	# this branch can only be emitted at this module's position in the link,
+	# after the selective archives. The group is still required -- OpenAL
+	# registers its ring-buffer helpers (CreateRingBuffer, DestroyRingBuffer,
+	# RingBufferSize, WriteRingBuffer and ReadRingBuffer) through internal
+	# function pointers, so a plain link drops them. Only the platform
 	# libraries stay here. The targets above are kept so the main module can
 	# name them, and the include directories below still reach this module's
 	# compile lines.
@@ -168,17 +148,14 @@ endif(EMSCRIPTEN)
 
 
 
-# These used to be plain-signature calls, which CMake treats as PUBLIC. The
-# PUBLIC keyword says the same thing and is required here because a target
-# linked with the keyword signature cannot also be linked with the plain one.
+# PUBLIC explicitly: the plain signature also means PUBLIC, and a target linked
+# with the keyword signature cannot also be linked with the plain one.
 target_link_libraries(oxygine-sound PUBLIC oxygine-framework)
 
 
-# The only directory a consumer ever saw: it now travels with the library as a
-# usage requirement instead of being copied into the parent scope as a string.
+# The only include directory a consumer sees, carried as a usage requirement.
 target_include_directories(oxygine-sound PUBLIC src)
-# Header directories the library's own sources compile against. The directory-scope
-# call used to apply them to every target in this directory; they are
+# Header directories the library's own sources compile against. They are
 # implementation details of oxygine-sound, so they stay PRIVATE.
 target_include_directories(oxygine-sound PRIVATE
 	dependencies/tremor/Tremor
