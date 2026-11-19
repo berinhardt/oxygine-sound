@@ -4,6 +4,7 @@
 #include <cstring>
 
 #include "../OggStream.h"
+#include "../SdlDeviceStart.h"
 #include "../null/SoundSystemNull.h"
 #include "SoundPCM.h"
 #include "SoundSDL.h"
@@ -38,8 +39,9 @@ SoundSystem* SoundSystem::create() {
       if (sdl->open()) {
          SoundSystem::instance = sdl;
       } else {
+         // open() already logged the one reason it failed. Do not add a
+         // second line: the no-device path is limited to one error line.
          delete sdl;
-         logs::error("SoundSystemSDL: cannot open audio device");
          SoundSystem::instance = new SoundSystemNull;
       }
    }
@@ -90,7 +92,12 @@ bool SoundSystemSDL::open() {
 
    _scratch.assign((size_t)_obtained.samples * 2, 0);
 
-   SDL_PauseAudioDevice(_device, 0);
+   // A fresh device is always audible: it starts with the engine-level flags
+   // clear, and the one-time start lives outside this directory so the
+   // lifecycle sources never take the device lock.
+   _paused.store(false);
+   _stopping.store(false);
+   startSdlAudioDevice(_device);
 
    // One line per device open, so the selected driver and the obtained spec
    // can be asserted from `adb logcat -s SDL` on the device.

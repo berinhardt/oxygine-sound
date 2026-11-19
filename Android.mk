@@ -36,6 +36,7 @@ LOCAL_SRC_FILES := \
 
 ifeq ($(SOUND_BACKEND),sdl)
 LOCAL_SRC_FILES += \
+		$(SRC)/SdlDeviceStart.cpp \
 		$(SRC)/sdl/Mixer.cpp \
 		$(SRC)/sdl/SoundPCM.cpp \
 		$(SRC)/sdl/SoundSDL.cpp \

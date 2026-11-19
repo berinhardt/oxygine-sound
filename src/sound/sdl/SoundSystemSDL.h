@@ -27,6 +27,9 @@ class SoundSystemSDL : public SoundSystem {
    bool open();
    bool isOpen() const { return _device != 0; }
 
+   // Pause and stop are engine-level flags the callback reads. None of these
+   // paths takes SDL's device lock: the lock has no timeout and a lifecycle
+   // thread can block in it forever.
    void release() override;
    void pause() override;
    void resume() override;
