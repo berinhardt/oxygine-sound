@@ -55,6 +55,10 @@ class Mixer {
    bool isActive(int voiceId) const;
    bool isPaused(int voiceId) const;
 
+   // Id of the voice in `slot`, or 0 when the slot is free. The backend mirrors
+   // this into lock-free storage, so a reader can answer without the lock.
+   int voiceIdAt(int slot) const;
+
   private:
    struct Voice {
       const int16_t* pcm = nullptr;

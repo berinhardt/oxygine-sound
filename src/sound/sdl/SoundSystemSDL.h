@@ -9,6 +9,7 @@
 
 #include "../SoundSystem.h"
 #include "Mixer.h"
+#include "VoiceActivity.h"
 
 namespace oxygine {
 
@@ -41,7 +42,9 @@ class SoundSystemSDL : public SoundSystem {
    void update() override;
 
    // Voice commands. The audio callback holds the same mutex only for the
-   // length of one render.
+   // length of one render. isVoiceActive() answers from the lock-free mirror
+   // that the command paths republish under that mutex, so the per-frame
+   // SoundHandleSDL::_update() never waits for the audio callback.
    int startVoice(const int16_t* pcm, int frames, int channels, int sampleRate,
                   float gain, bool loop);
    void stopVoice(int voiceId);
@@ -89,6 +92,12 @@ class SoundSystemSDL : public SoundSystem {
 
    mutable std::mutex _mutex;
    Mixer _mixer;
+
+   // Per-voice activity, republished under _mutex by every path that changes
+   // the mixer's active set. isVoiceActive() reads it without the lock, so
+   // SoundHandleSDL::_update() does not contend with the audio callback.
+   VoiceActivity _voiceActivity;
+
    std::atomic<bool> _paused;
    std::atomic<bool> _stopping;
 

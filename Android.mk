@@ -3,7 +3,8 @@ LOCAL_PATH := $(call my-dir)
 # The Android app ships exactly one sound engine: the SDL2 backend in
 # src/sound/sdl. The null backend is always linked because it owns
 # SoundSystem::instance and is the no-device fallback. The shared OpenAL
-# sources in src/sound/oal stay in the tree for the iOS build but are not
+# sources in src/sound/oal stay in the tree for the iOS build and for the
+# desktop backend that deps/oxygine-sound/CMakeLists.txt builds; they are not
 # compiled for Android (sdl-audio#15 retired the vendored Android OpenAL tree).
 
 include $(CLEAR_VARS)
@@ -31,7 +32,8 @@ LOCAL_SRC_FILES := \
 		$(SRC)/sdl/SoundPCM.cpp \
 		$(SRC)/sdl/SoundSDL.cpp \
 		$(SRC)/sdl/SoundHandleSDL.cpp \
-		$(SRC)/sdl/SoundSystemSDL.cpp
+		$(SRC)/sdl/SoundSystemSDL.cpp \
+		$(SRC)/sdl/VoiceActivity.cpp
 
 
 LOCAL_CFLAGS := -DOXYGINE_SOUND=1

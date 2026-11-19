@@ -192,4 +192,10 @@ bool Mixer::isPaused(int voiceId) const {
    return voice != nullptr && voice->paused;
 }
 
+int Mixer::voiceIdAt(int slot) const {
+   if (slot < 0 || slot >= kMaxVoices) return 0;
+   const Voice& voice = voices_[slot];
+   return voice.active ? voice.id : 0;
+}
+
 }  // namespace oxygine

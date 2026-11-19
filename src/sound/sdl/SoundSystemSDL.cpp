@@ -143,6 +143,7 @@ void SoundSystemSDL::resetDevice() {
       std::lock_guard<std::mutex> lock(_mutex);
       _mixer.stopAll();
       _activeVoices.store(0, std::memory_order_relaxed);
+      _voiceActivity.publish(_mixer);
    }
 
    _scratch.clear();
@@ -182,6 +183,7 @@ void SoundSystemSDL::stop() {
    std::lock_guard<std::mutex> lock(_mutex);
    _mixer.stopAll();
    _activeVoices.store(0, std::memory_order_relaxed);
+   _voiceActivity.publish(_mixer);
 }
 
 Sound* SoundSystemSDL::createSound(const char* path, bool streaming) {
@@ -255,6 +257,7 @@ int SoundSystemSDL::startVoice(const int16_t* pcm, int frames, int channels, int
    std::lock_guard<std::mutex> lock(_mutex);
    const int id = _mixer.start(pcm, frames, channels, sampleRate, gain, loop);
    _activeVoices.store(_mixer.activeVoices(), std::memory_order_relaxed);
+   _voiceActivity.publish(_mixer);
    return id;
 }
 
@@ -262,6 +265,7 @@ void SoundSystemSDL::stopVoice(int voiceId) {
    std::lock_guard<std::mutex> lock(_mutex);
    _mixer.stop(voiceId);
    _activeVoices.store(_mixer.activeVoices(), std::memory_order_relaxed);
+   _voiceActivity.publish(_mixer);
 }
 
 void SoundSystemSDL::pauseVoice(int voiceId) {
@@ -275,8 +279,10 @@ void SoundSystemSDL::resumeVoice(int voiceId) {
 }
 
 bool SoundSystemSDL::isVoiceActive(int voiceId) const {
-   std::lock_guard<std::mutex> lock(_mutex);
-   return _mixer.isActive(voiceId);
+   // No lock: the command paths and the render republish this mirror while
+   // they hold the device mutex, so the per-frame handle update never waits
+   // for the audio callback.
+   return _voiceActivity.isActive(voiceId);
 }
 
 int SoundSystemSDL::activeVoices() const {
@@ -373,6 +379,7 @@ void SoundSystemSDL::render(Uint8* stream, int len) {
 
       // A one-shot that reached its end in this buffer freed its slot here.
       _activeVoices.store(_mixer.activeVoices(), std::memory_order_relaxed);
+      _voiceActivity.publish(_mixer);
    }
 
    const unsigned long long endNs = threadCpuNs();
