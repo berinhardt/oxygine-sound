@@ -109,16 +109,13 @@ elseif(ANDROID)
 	target_include_directories(oxygine-sound BEFORE PRIVATE
 		"${CMAKE_CURRENT_SOURCE_DIR}/../glm/")
 
-	# openal, libogg and tremor are linked whole by the main module's ordered
-	# whole-archive group (cmake/android.cmake), not here: a pair declared in
-	# this branch can only be emitted at this module's position in the link,
-	# after the selective archives. The group is still required -- OpenAL
-	# registers its ring-buffer helpers (CreateRingBuffer, DestroyRingBuffer,
-	# RingBufferSize, WriteRingBuffer and ReadRingBuffer) through internal
-	# function pointers, so a plain link drops them. Only the platform
-	# libraries stay here. The targets above are kept so the main module can
-	# name them, and the include directories below still reach this module's
-	# compile lines.
+	# openal, libogg and tremor are named by the main module's ordered link list
+	# at a fixed position; they are linked there, selectively and not whole, and
+	# are not named here. A link declared in this branch can only be emitted at
+	# this module's position in the link, after the selective archives. Only the
+	# platform libraries stay here. The targets above are kept so the main
+	# module can name them, and the include directories below still reach this
+	# module's compile lines.
 	target_link_libraries(oxygine-sound PUBLIC OpenSLES dl log)
 
 else(EMSCRIPTEN)
