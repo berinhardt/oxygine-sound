@@ -52,6 +52,30 @@ class SoundSystemSDL : public SoundSystem {
    int activeVoices() const;
    int peakVoices() const;
 
+   // Debug counters for a device run. The device probe reads them so a build
+   // without a debugger can report what the audio thread did. `mixedBytes`
+   // counts bytes the mixer actually rendered (silence emitted by the pause
+   // or stop flag is not counted), `underruns` counts callbacks that arrived
+   // more than four buffer periods late or whose mixing overran one period,
+   // and `callbackFraction` is the worst callback duration divided by the
+   // buffer period.
+   struct DebugStats {
+      const char* driver;
+      const char* format;
+      int freq;
+      int channels;
+      int samples;
+      int activeVoices;
+      int peakVoices;
+      unsigned long long underruns;
+      unsigned long long mixedBytes;
+      unsigned long long callbacks;
+      double callbackFraction;
+   };
+
+   DebugStats debugStats() const;
+   void resetDebugStats();
+
    private:
    static void audioCallback(void* userdata, Uint8* stream, int len);
    void render(Uint8* stream, int len);
@@ -64,6 +88,14 @@ class SoundSystemSDL : public SoundSystem {
    Mixer _mixer;
    std::atomic<bool> _paused;
    std::atomic<bool> _stopping;
+
+   // Written by the audio callback, read by debugStats(). Plain counters
+   // would tear when the probe read them mid-callback.
+   std::atomic<unsigned long long> _underruns;
+   std::atomic<unsigned long long> _mixedBytes;
+   std::atomic<unsigned long long> _callbacks;
+   std::atomic<unsigned long long> _callbackMaxNs;
+   std::atomic<unsigned long long> _lastCallbackStartNs;
 
    // Callback scratch for a mono device; sized once when the device opens so
    // the callback allocates nothing.

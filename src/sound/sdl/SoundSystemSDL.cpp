@@ -1,5 +1,6 @@
 #include "SoundSystemSDL.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 
@@ -21,6 +22,12 @@ const char* formatName(Uint16 format) {
    if (format == AUDIO_U8) return "U8";
    if (format == AUDIO_S8) return "S8";
    return "other";
+}
+
+unsigned long long monotonicNs() {
+   return (unsigned long long)std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now().time_since_epoch())
+       .count();
 }
 
 bool decodeOggStream(SoundStream& stream, SoundPCM& pcm, const char* name) {
@@ -50,7 +57,14 @@ SoundSystem* SoundSystem::create() {
 }
 
 SoundSystemSDL::SoundSystemSDL()
-    : _device(0), _paused(false), _stopping(false) {
+    : _device(0),
+      _paused(false),
+      _stopping(false),
+      _underruns(0),
+      _mixedBytes(0),
+      _callbacks(0),
+      _callbackMaxNs(0),
+      _lastCallbackStartNs(0) {
    SDL_zero(_obtained);
 }
 
@@ -240,6 +254,43 @@ int SoundSystemSDL::peakVoices() const {
    return _mixer.peakVoices();
 }
 
+SoundSystemSDL::DebugStats SoundSystemSDL::debugStats() const {
+   DebugStats stats;
+   const char* driver = SDL_GetCurrentAudioDriver();
+   stats.driver = driver ? driver : "unknown";
+   stats.format = formatName(_obtained.format);
+   stats.freq = (int)_obtained.freq;
+   stats.channels = (int)_obtained.channels;
+   stats.samples = (int)_obtained.samples;
+
+   {
+      std::lock_guard<std::mutex> lock(_mutex);
+      stats.activeVoices = _mixer.activeVoices();
+      stats.peakVoices = _mixer.peakVoices();
+   }
+
+   stats.underruns = _underruns.load(std::memory_order_relaxed);
+   stats.mixedBytes = _mixedBytes.load(std::memory_order_relaxed);
+   stats.callbacks = _callbacks.load(std::memory_order_relaxed);
+
+   const unsigned long long maxNs = _callbackMaxNs.load(std::memory_order_relaxed);
+   const unsigned long long periodNs =
+       (_obtained.freq > 0) ? (unsigned long long)_obtained.samples * 1000000000ull / _obtained.freq
+                            : 0;
+   stats.callbackFraction = periodNs ? (double)maxNs / (double)periodNs : 0.0;
+   return stats;
+}
+
+void SoundSystemSDL::resetDebugStats() {
+   _underruns.store(0, std::memory_order_relaxed);
+   _mixedBytes.store(0, std::memory_order_relaxed);
+   _callbacks.store(0, std::memory_order_relaxed);
+   _callbackMaxNs.store(0, std::memory_order_relaxed);
+   // 0 makes the next callback skip the arrival-gap check, so a reset never
+   // reports the silence between the reset and the next callback.
+   _lastCallbackStartNs.store(0, std::memory_order_relaxed);
+}
+
 void SoundSystemSDL::audioCallback(void* userdata, Uint8* stream, int len) {
    static_cast<SoundSystemSDL*>(userdata)->render(stream, len);
 }
@@ -248,6 +299,13 @@ void SoundSystemSDL::render(Uint8* stream, int len) {
    const int channelBytes = (int)sizeof(int16_t) * (int)_obtained.channels;
    if (!stream || len <= 0 || channelBytes <= 0) return;
 
+   // The probe reports a callback duration as a fraction of the buffer
+   // period, so measure the whole render. The clock is the only non-audio
+   // call here; it neither allocates nor takes the device lock.
+   const unsigned long long startNs = monotonicNs();
+   const unsigned long long lastStartNs =
+       _lastCallbackStartNs.exchange(startNs, std::memory_order_relaxed);
+
    if (_paused.load(std::memory_order_relaxed) || _stopping.load(std::memory_order_relaxed)) {
       memset(stream, 0, (size_t)len);
       return;
@@ -255,27 +313,52 @@ void SoundSystemSDL::render(Uint8* stream, int len) {
 
    const int frames = len / channelBytes;
 
-   std::lock_guard<std::mutex> lock(_mutex);
-   if (_stopping.load(std::memory_order_relaxed)) {
-      memset(stream, 0, (size_t)len);
-      return;
+   {
+      std::lock_guard<std::mutex> lock(_mutex);
+      if (_stopping.load(std::memory_order_relaxed)) {
+         memset(stream, 0, (size_t)len);
+         return;
+      }
+
+      if (_obtained.channels == 2) {
+         _mixer.render(reinterpret_cast<int16_t*>(stream), frames);
+      } else {
+         const int scratchFrames = (int)(_scratch.size() / 2);
+         const int renderFrames = frames < scratchFrames ? frames : scratchFrames;
+         _mixer.render(_scratch.data(), renderFrames);
+
+         int16_t* out = reinterpret_cast<int16_t*>(stream);
+         for (int f = 0; f < renderFrames; ++f) {
+            out[f] = (int16_t)((_scratch[(size_t)f * 2] + _scratch[(size_t)f * 2 + 1]) / 2);
+         }
+         if (renderFrames < frames) {
+            memset(out + renderFrames, 0, (size_t)(frames - renderFrames) * sizeof(int16_t));
+         }
+      }
    }
 
-   if (_obtained.channels == 2) {
-      _mixer.render(reinterpret_cast<int16_t*>(stream), frames);
-      return;
+   const unsigned long long endNs = monotonicNs();
+   _callbacks.fetch_add(1, std::memory_order_relaxed);
+   _mixedBytes.fetch_add((unsigned long long)len, std::memory_order_relaxed);
+
+   const unsigned long long periodNs =
+       (_obtained.freq > 0) ? (unsigned long long)_obtained.samples * 1000000000ull / _obtained.freq
+                            : 0;
+   if (!periodNs) return;
+
+   const unsigned long long durationNs = endNs - startNs;
+   unsigned long long current = _callbackMaxNs.load(std::memory_order_relaxed);
+   while (durationNs > current &&
+          !_callbackMaxNs.compare_exchange_weak(current, durationNs, std::memory_order_relaxed)) {
    }
 
-   const int scratchFrames = (int)(_scratch.size() / 2);
-   const int renderFrames = frames < scratchFrames ? frames : scratchFrames;
-   _mixer.render(_scratch.data(), renderFrames);
-
-   int16_t* out = reinterpret_cast<int16_t*>(stream);
-   for (int f = 0; f < renderFrames; ++f) {
-      out[f] = (int16_t)((_scratch[(size_t)f * 2] + _scratch[(size_t)f * 2 + 1]) / 2);
-   }
-   if (renderFrames < frames) {
-      memset(out + renderFrames, 0, (size_t)(frames - renderFrames) * sizeof(int16_t));
+   // An underrun is a callback that could not keep the device fed: it either
+   // ran longer than one buffer period, or arrived more than four periods
+   // after the previous one. The slack keeps scheduler jitter from being
+   // reported as a starved device.
+   if (durationNs >= periodNs) _underruns.fetch_add(1, std::memory_order_relaxed);
+   if (lastStartNs && startNs - lastStartNs > periodNs * 4) {
+      _underruns.fetch_add(1, std::memory_order_relaxed);
    }
 }
 
