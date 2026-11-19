@@ -10,14 +10,13 @@ namespace oxygine {
 // makes outside its own pause and stop flags.
 //
 // It is deliberately kept out of src/sound/sdl. The backend's lifecycle
-// sources must contain no device-lock call, because that lock has no timeout;
-// locking a just-opened device would deadlock the very path the engine is
-// trying to avoid. The check in test/android asserts that invariant by
-// scanning that directory.
+// sources must contain no device-lock call, because that lock has no timeout
+// and a lifecycle thread can block in it forever; the check in test/android
+// asserts that invariant by scanning that directory.
 //
 // open() calls this once, on the thread that just created the device, before
 // any other thread can hold a reference to its id. At that point the device
-// lock has no other holder, so the call is bounded.
+// lock has no other holder, so the call cannot wait.
 void startSdlAudioDevice(SDL_AudioDeviceID device);
 
 }  // namespace oxygine
