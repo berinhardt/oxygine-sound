@@ -1,8 +1,8 @@
 #include "SoundSystemSDL.h"
 
-#include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <time.h>
 
 #include "../OggStream.h"
 #include "../SdlDeviceStart.h"
@@ -24,10 +24,14 @@ const char* formatName(Uint16 format) {
    return "other";
 }
 
-unsigned long long monotonicNs() {
-   return (unsigned long long)std::chrono::duration_cast<std::chrono::nanoseconds>(
-              std::chrono::steady_clock::now().time_since_epoch())
-       .count();
+// CPU time consumed by this thread. It excludes time the thread was
+// descheduled, so a loaded host cannot turn the engine's underrun counter
+// into a scheduler-noise counter. If the clock is unavailable, the callback
+// simply reports no duration.
+unsigned long long threadCpuNs() {
+   timespec ts;
+   if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0) return 0;
+   return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;
 }
 
 bool decodeOggStream(SoundStream& stream, SoundPCM& pcm, const char* name) {
@@ -63,8 +67,7 @@ SoundSystemSDL::SoundSystemSDL()
       _underruns(0),
       _mixedBytes(0),
       _callbacks(0),
-      _callbackMaxNs(0),
-      _lastCallbackStartNs(0) {
+      _callbackMaxNs(0) {
    SDL_zero(_obtained);
 }
 
@@ -286,9 +289,6 @@ void SoundSystemSDL::resetDebugStats() {
    _mixedBytes.store(0, std::memory_order_relaxed);
    _callbacks.store(0, std::memory_order_relaxed);
    _callbackMaxNs.store(0, std::memory_order_relaxed);
-   // 0 makes the next callback skip the arrival-gap check, so a reset never
-   // reports the silence between the reset and the next callback.
-   _lastCallbackStartNs.store(0, std::memory_order_relaxed);
 }
 
 void SoundSystemSDL::audioCallback(void* userdata, Uint8* stream, int len) {
@@ -300,11 +300,11 @@ void SoundSystemSDL::render(Uint8* stream, int len) {
    if (!stream || len <= 0 || channelBytes <= 0) return;
 
    // The probe reports a callback duration as a fraction of the buffer
-   // period, so measure the whole render. The clock is the only non-audio
-   // call here; it neither allocates nor takes the device lock.
-   const unsigned long long startNs = monotonicNs();
-   const unsigned long long lastStartNs =
-       _lastCallbackStartNs.exchange(startNs, std::memory_order_relaxed);
+   // period, so measure the whole render. This is thread CPU time: a
+   // descheduled callback costs no CPU and must not be reported as the
+   // engine failing to feed the device. The clock neither allocates nor
+   // takes the device lock.
+   const unsigned long long startNs = threadCpuNs();
 
    if (_paused.load(std::memory_order_relaxed) || _stopping.load(std::memory_order_relaxed)) {
       memset(stream, 0, (size_t)len);
@@ -337,14 +337,14 @@ void SoundSystemSDL::render(Uint8* stream, int len) {
       }
    }
 
-   const unsigned long long endNs = monotonicNs();
+   const unsigned long long endNs = threadCpuNs();
    _callbacks.fetch_add(1, std::memory_order_relaxed);
    _mixedBytes.fetch_add((unsigned long long)len, std::memory_order_relaxed);
 
    const unsigned long long periodNs =
        (_obtained.freq > 0) ? (unsigned long long)_obtained.samples * 1000000000ull / _obtained.freq
                             : 0;
-   if (!periodNs) return;
+   if (!periodNs || endNs < startNs) return;
 
    const unsigned long long durationNs = endNs - startNs;
    unsigned long long current = _callbackMaxNs.load(std::memory_order_relaxed);
@@ -352,14 +352,13 @@ void SoundSystemSDL::render(Uint8* stream, int len) {
           !_callbackMaxNs.compare_exchange_weak(current, durationNs, std::memory_order_relaxed)) {
    }
 
-   // An underrun is a callback that could not keep the device fed: it either
-   // ran longer than one buffer period, or arrived more than four periods
-   // after the previous one. The slack keeps scheduler jitter from being
-   // reported as a starved device.
+   // An underrun is the engine failing to produce the next buffer in time:
+   // the callback's own mixing work consumed a whole buffer period of CPU.
+   // That is independent of how long the process was descheduled, so a
+   // loaded host cannot manufacture one. Wall-clock lateness is not counted;
+   // it cannot be told apart from scheduling noise without a device-owned
+   // queue counter, which SDL does not expose.
    if (durationNs >= periodNs) _underruns.fetch_add(1, std::memory_order_relaxed);
-   if (lastStartNs && startNs - lastStartNs > periodNs * 4) {
-      _underruns.fetch_add(1, std::memory_order_relaxed);
-   }
 }
 
 }  // namespace oxygine

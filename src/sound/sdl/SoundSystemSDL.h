@@ -55,10 +55,12 @@ class SoundSystemSDL : public SoundSystem {
    // Debug counters for a device run. The device probe reads them so a build
    // without a debugger can report what the audio thread did. `mixedBytes`
    // counts bytes the mixer actually rendered (silence emitted by the pause
-   // or stop flag is not counted), `underruns` counts callbacks that arrived
-   // more than four buffer periods late or whose mixing overran one period,
-   // and `callbackFraction` is the worst callback duration divided by the
-   // buffer period.
+   // or stop flag is not counted), `underruns` counts callbacks whose own
+   // mixing work used a whole buffer period of CPU time (the engine could
+   // not produce the buffer in time), and `callbackFraction` is the worst
+   // callback CPU duration divided by the buffer period. Wall-clock lateness
+   // is deliberately excluded: it reports process descheduling, not the
+   // engine failing to keep the device fed.
    struct DebugStats {
       const char* driver;
       const char* format;
@@ -95,7 +97,6 @@ class SoundSystemSDL : public SoundSystem {
    std::atomic<unsigned long long> _mixedBytes;
    std::atomic<unsigned long long> _callbacks;
    std::atomic<unsigned long long> _callbackMaxNs;
-   std::atomic<unsigned long long> _lastCallbackStartNs;
 
    // Callback scratch for a mono device; sized once when the device opens so
    // the callback allocates nothing.
