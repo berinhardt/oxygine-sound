@@ -22,7 +22,7 @@ SoundSystemSDL* SoundHandleSDL::ss() const {
 
 void SoundHandleSDL::_play() {
    if (_voiceId) {
-      ss()->stopVoice(_voiceId);
+      if (SoundSystemSDL* previous = ss()) previous->stopVoice(_voiceId);
       _voiceId = 0;
    }
 
