@@ -54,13 +54,14 @@ class SoundSystemSDL : public SoundSystem {
 
    // Debug counters for a device run. The device probe reads them so a build
    // without a debugger can report what the audio thread did. `mixedBytes`
-   // counts bytes the mixer actually rendered (silence emitted by the pause
-   // or stop flag is not counted), `underruns` counts callbacks whose own
-   // mixing work used a whole buffer period of CPU time (the engine could
-   // not produce the buffer in time), and `callbackFraction` is the worst
-   // callback CPU duration divided by the buffer period. Wall-clock lateness
-   // is deliberately excluded: it reports process descheduling, not the
-   // engine failing to keep the device fed.
+   // counts the bytes of callbacks where at least one voice was active;
+   // callbacks that only emitted silence because nothing was playing, or
+   // because the pause or stop flag was set, are not counted. `underruns`
+   // counts callbacks whose own mixing work used a whole buffer period of CPU
+   // time (the engine could not produce the buffer in time), and
+   // `callbackFraction` is the worst callback CPU duration divided by the
+   // buffer period. Wall-clock lateness is deliberately excluded: it reports
+   // process descheduling, not the engine failing to keep the device fed.
    struct DebugStats {
       const char* driver;
       const char* format;
@@ -90,6 +91,11 @@ class SoundSystemSDL : public SoundSystem {
    Mixer _mixer;
    std::atomic<bool> _paused;
    std::atomic<bool> _stopping;
+
+   // Occupied voice slots for the per-frame debug line. Every path that
+   // changes the mixer's active set stores the new count while it holds
+   // _mutex; update() reads it without taking the mutex.
+   std::atomic<int> _activeVoices;
 
    // Written by the audio callback, read by debugStats(). Plain counters
    // would tear when the probe read them mid-callback.

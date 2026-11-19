@@ -9,6 +9,9 @@ namespace oxygine {
 
 SoundHandleSDL::SoundHandleSDL(SoundSDL* sound)
     : _sound(sound), _voiceId(0), _positionMs(0), _tick(0) {
+   // SoundHandle::getDuration() and SoundInstance::getDuration() read this;
+   // SoundHandle's constructor leaves it indeterminate.
+   _duration = sound ? sound->getDuration() : 0;
 }
 
 SoundHandleSDL::~SoundHandleSDL() {

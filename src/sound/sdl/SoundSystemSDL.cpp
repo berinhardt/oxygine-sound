@@ -64,6 +64,7 @@ SoundSystemSDL::SoundSystemSDL()
     : _device(0),
       _paused(false),
       _stopping(false),
+      _activeVoices(0),
       _underruns(0),
       _mixedBytes(0),
       _callbacks(0),
@@ -141,6 +142,7 @@ void SoundSystemSDL::resetDevice() {
    {
       std::lock_guard<std::mutex> lock(_mutex);
       _mixer.stopAll();
+      _activeVoices.store(0, std::memory_order_relaxed);
    }
 
    _scratch.clear();
@@ -149,6 +151,22 @@ void SoundSystemSDL::resetDevice() {
 }
 
 void SoundSystemSDL::release() {
+   // Decision 15's remaining surface: peak voices, the worst callback duration
+   // as a fraction of the buffer period, and the underrun count, reported once
+   // per device run. It is outside the audio callback and outside the fixed
+   // `channels:` line, and it is unconditional because Android never defines
+   // OX_DEBUG (the init line from the same decision is unconditional too).
+   // SoundSystem::free() calls release() after an explicit release(); the
+   // closed device skips the second line.
+   if (_device) {
+      const DebugStats stats = debugStats();
+      char line[192];
+      snprintf(line, sizeof(line),
+               "SoundSystemSDL release: peak_voices=%d callback_fraction=%.3f underruns=%llu",
+               stats.peakVoices, stats.callbackFraction, stats.underruns);
+      logs::out(line);
+   }
+
    resetDevice();
 }
 
@@ -163,24 +181,31 @@ void SoundSystemSDL::resume() {
 void SoundSystemSDL::stop() {
    std::lock_guard<std::mutex> lock(_mutex);
    _mixer.stopAll();
+   _activeVoices.store(0, std::memory_order_relaxed);
 }
 
 Sound* SoundSystemSDL::createSound(const char* path, bool streaming) {
    (void)streaming;  // Every clip is a fully decoded one-shot.
 
-   if (!path) return 0;
-
-   file::handle fh = file::open(path, "srb", ep_show_warning);
-   if (!fh) {
-      logs::error("SoundSystemSDL: cannot open '%s'", path);
+   if (!path) {
+      logs::error("SoundSystemSDL: cannot open a null sound path");
       return 0;
    }
+
+   // file::open warns once on failure (oxygine.cpp), so this branch adds no
+   // second line: decision 7 allows exactly one per open failure.
+   file::handle fh = file::open(path, "srb", ep_show_warning);
+   if (!fh) return 0;
 
    SoundPCM pcm;
    bool decoded = false;
    {
       OggStream ogg;
-      if (ogg.init(fh, false)) decoded = decodeOggStream(ogg, pcm, path);
+      if (!ogg.init(fh, false)) {
+         logs::error("SoundSystemSDL: cannot decode '%s'", path);
+      } else {
+         decoded = decodeOggStream(ogg, pcm, path);
+      }
    }
    file::close(fh);
 
@@ -215,8 +240,12 @@ void SoundSystemSDL::update() {
    if (!_device) return;
 
    if (DebugActor::instance) {
+      // Decision 9: the game thread holds the audio mutex only while applying
+      // a command, so this per-frame line reads the count the command paths
+      // keep current instead of locking.
       char str[64];
-      snprintf(str, sizeof(str), "channels: %d/%d", activeVoices(), Mixer::kMaxVoices);
+      snprintf(str, sizeof(str), "channels: %d/%d",
+               _activeVoices.load(std::memory_order_relaxed), Mixer::kMaxVoices);
       DebugActor::instance->addDebugString(str);
    }
 }
@@ -224,12 +253,15 @@ void SoundSystemSDL::update() {
 int SoundSystemSDL::startVoice(const int16_t* pcm, int frames, int channels, int sampleRate,
                                float gain, bool loop) {
    std::lock_guard<std::mutex> lock(_mutex);
-   return _mixer.start(pcm, frames, channels, sampleRate, gain, loop);
+   const int id = _mixer.start(pcm, frames, channels, sampleRate, gain, loop);
+   _activeVoices.store(_mixer.activeVoices(), std::memory_order_relaxed);
+   return id;
 }
 
 void SoundSystemSDL::stopVoice(int voiceId) {
    std::lock_guard<std::mutex> lock(_mutex);
    _mixer.stop(voiceId);
+   _activeVoices.store(_mixer.activeVoices(), std::memory_order_relaxed);
 }
 
 void SoundSystemSDL::pauseVoice(int voiceId) {
@@ -312,6 +344,7 @@ void SoundSystemSDL::render(Uint8* stream, int len) {
    }
 
    const int frames = len / channelBytes;
+   bool voicesActive = false;
 
    {
       std::lock_guard<std::mutex> lock(_mutex);
@@ -319,6 +352,8 @@ void SoundSystemSDL::render(Uint8* stream, int len) {
          memset(stream, 0, (size_t)len);
          return;
       }
+
+      voicesActive = _mixer.activeVoices() > 0;
 
       if (_obtained.channels == 2) {
          _mixer.render(reinterpret_cast<int16_t*>(stream), frames);
@@ -335,11 +370,16 @@ void SoundSystemSDL::render(Uint8* stream, int len) {
             memset(out + renderFrames, 0, (size_t)(frames - renderFrames) * sizeof(int16_t));
          }
       }
+
+      // A one-shot that reached its end in this buffer freed its slot here.
+      _activeVoices.store(_mixer.activeVoices(), std::memory_order_relaxed);
    }
 
    const unsigned long long endNs = threadCpuNs();
    _callbacks.fetch_add(1, std::memory_order_relaxed);
-   _mixedBytes.fetch_add((unsigned long long)len, std::memory_order_relaxed);
+   // Bytes are "mixed" only when a voice was active for the buffer; a callback
+   // that had nothing to play emitted silence and is not counted.
+   if (voicesActive) _mixedBytes.fetch_add((unsigned long long)len, std::memory_order_relaxed);
 
    const unsigned long long periodNs =
        (_obtained.freq > 0) ? (unsigned long long)_obtained.samples * 1000000000ull / _obtained.freq
