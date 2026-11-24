@@ -109,14 +109,13 @@ elseif(ANDROID)
 	target_include_directories(oxygine-sound BEFORE PRIVATE
 		"${CMAKE_CURRENT_SOURCE_DIR}/../glm/")
 
-	# openal, libogg and tremor are named by the main module's ordered link list
-	# at a fixed position; they are linked there, selectively and not whole, and
-	# are not named here. A link declared in this branch can only be emitted at
-	# this module's position in the link, after the selective archives. Only the
-	# platform libraries stay here. The targets above are kept so the main
-	# module can name them, and the include directories below still reach this
-	# module's compile lines.
-	target_link_libraries(oxygine-sound PUBLIC OpenSLES dl log)
+	# libogg, openal and tremor belong to this module: its sources include
+	# ogg/ogg.h and AL/al.h and call into both. They are named here, by the
+	# module whose own sources reference them, PUBLIC because a static target's
+	# link dependency reaches its consumers whether it is written PUBLIC or
+	# PRIVATE, and selectively rather than whole. The platform libraries stay
+	# alongside them.
+	target_link_libraries(oxygine-sound PUBLIC libogg openal tremor OpenSLES dl log)
 
 else(EMSCRIPTEN)
 	if (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
