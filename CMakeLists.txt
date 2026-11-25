@@ -27,11 +27,33 @@ set(SRC
 
 # src/sound/emscripten/ holds an alternative emscripten backend --
 # SoundEmscripten, SoundHandleEmscripten, SoundSystemEmscripten and their
-# headers -- that nothing in this file compiles. The OAL and null lists below
-# are built on every platform, emscripten included; those sources are named
-# here only so the unused backend stays discoverable.
+# headers -- that nothing in this file compiles. Those sources are named here
+# only so the unused backend stays discoverable.
 add_subdirectory(dependencies/tremor tremor)
 
+# src/sound/oal and src/sound/sdl each define SoundSystem::create(), so a
+# platform compiles exactly one of them: Android ships the SDL2 engine and
+# does not compile oal, while Emscripten and the native graphs keep the OAL
+# engine. The null backend is linked on every platform because it owns
+# SoundSystem::instance and is the no-device fallback.
+if (ANDROID)
+	set (SRC ${SRC}
+		src/sound/SdlDeviceStart.cpp
+		src/sound/SdlDeviceStart.h
+		src/sound/sdl/Mixer.cpp
+		src/sound/sdl/Mixer.h
+		src/sound/sdl/SoundHandleSDL.cpp
+		src/sound/sdl/SoundHandleSDL.h
+		src/sound/sdl/SoundPCM.cpp
+		src/sound/sdl/SoundPCM.h
+		src/sound/sdl/SoundSDL.cpp
+		src/sound/sdl/SoundSDL.h
+		src/sound/sdl/SoundSystemSDL.cpp
+		src/sound/sdl/SoundSystemSDL.h
+		src/sound/sdl/VoiceActivity.cpp
+		src/sound/sdl/VoiceActivity.h
+		)
+else ()
 	set (SRC ${SRC}
 		src/sound/oal/SoundHandleOAL.cpp
 		src/sound/oal/SoundHandleOAL.h
@@ -45,14 +67,17 @@ add_subdirectory(dependencies/tremor tremor)
 		src/sound/oal/StaticStreamOAL.h
 		src/sound/oal/StreamingSoundHandleOAL.cpp
 		src/sound/oal/StreamingSoundHandleOAL.h
-
-		src/sound/null/SoundSystemNull.cpp
-		src/sound/null/SoundSystemNull.h
-		src/sound/null/SoundNull.cpp
-		src/sound/null/SoundNull.h
-		src/sound/null/SoundHandleNull.cpp
-		src/sound/null/SoundHandleNull.h
 		)
+endif ()
+
+set (SRC ${SRC}
+	src/sound/null/SoundSystemNull.cpp
+	src/sound/null/SoundSystemNull.h
+	src/sound/null/SoundNull.cpp
+	src/sound/null/SoundNull.h
+	src/sound/null/SoundHandleNull.cpp
+	src/sound/null/SoundHandleNull.h
+	)
 
 add_library(oxygine-sound STATIC ${SRC})
 if (ANDROID)
@@ -78,25 +103,17 @@ if(EMSCRIPTEN)
 	target_link_options(oxygine-sound PUBLIC -sUSE_OGG=1)
 
 elseif(ANDROID)
-	# Android has neither library available as a plain name. OpenAL is a
-	# per-ABI prebuilt static archive, and it is not in the tree for every ABI,
-	# so a missing archive has to fail here rather than at link time. Ogg is
-	# built from source here; tremor is built above on every platform.
+	# Android ships the SDL2 engine. SDL2 is a target of the root graph --
+	# added before this module -- so naming it here supplies <SDL.h> and its
+	# include directories at compile time; the app still loads SDL2 as its
+	# shared library. Ogg is built from source here; tremor is built above on
+	# every platform.
 	add_subdirectory(dependencies/libogg libogg)
 
-	set(ANDROID_OPENAL_LIB
-		${CMAKE_CURRENT_SOURCE_DIR}/dependencies/openal-android/obj/local/${ANDROID_ABI}/libopenal.a)
-	if(NOT EXISTS ${ANDROID_OPENAL_LIB})
-		message(FATAL_ERROR
-			"Missing prebuilt OpenAL for ${ANDROID_ABI}: ${ANDROID_OPENAL_LIB}")
-	endif()
-	add_library(openal STATIC IMPORTED)
-	set_target_properties(openal PROPERTIES IMPORTED_LOCATION ${ANDROID_OPENAL_LIB})
-
-	# src/sound/OggStream.cpp includes ogg/ogg.h and the oal sources include
-	# AL/al.h, so both directories have to be on the include path.
+	# src/sound/OggStream.cpp includes ogg/ogg.h. The SDL backend reaches
+	# <SDL.h> through the SDL2 target's PUBLIC include directories, so the
+	# retired Android OpenAL header tree is not needed.
 	target_include_directories(oxygine-sound PRIVATE
-		dependencies/openal-android/jni/OpenAL/include
 		dependencies/libogg/include)
 
 	# This module's own translation units reach the framework headers through
@@ -109,13 +126,14 @@ elseif(ANDROID)
 	target_include_directories(oxygine-sound BEFORE PRIVATE
 		"${CMAKE_CURRENT_SOURCE_DIR}/../glm/")
 
-	# libogg, openal and tremor belong to this module: its sources include
-	# ogg/ogg.h and AL/al.h and call into both. They are named here, by the
-	# module whose own sources reference them, PUBLIC because a static target's
-	# link dependency reaches its consumers whether it is written PUBLIC or
-	# PRIVATE, and selectively rather than whole. The platform libraries stay
-	# alongside them.
-	target_link_libraries(oxygine-sound PUBLIC libogg openal tremor OpenSLES dl log)
+	# libogg, SDL2 and tremor belong to this module: its sources include
+	# ogg/ogg.h, call into both audio libraries and open the SDL device. They
+	# are named here, by the module whose own sources reference them, PUBLIC
+	# because a static target's link dependency reaches its consumers whether
+	# it is written PUBLIC or PRIVATE, and selectively rather than whole.
+	# dl and log are the platform libraries ndk-build exported. OpenSLES is
+	# gone with the oal sources: the SDL backend does not touch it.
+	target_link_libraries(oxygine-sound PUBLIC libogg tremor SDL2 dl log)
 
 else(EMSCRIPTEN)
 	if (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
@@ -156,6 +174,8 @@ target_include_directories(oxygine-sound PUBLIC src)
 target_include_directories(oxygine-sound PRIVATE
 	dependencies/tremor/Tremor
 	dependencies/libogg/include)
-if(NOT EMSCRIPTEN)
+# Desktop OpenAL headers. Android compiles the SDL backend instead, and
+# Emscripten takes them from emcc's port.
+if(NOT ANDROID AND NOT EMSCRIPTEN)
 	target_include_directories(oxygine-sound PRIVATE dependencies/openal/include)
-endif(NOT EMSCRIPTEN)
+endif()
